@@ -71,11 +71,12 @@ This console builds the immutable ledger for reputation tracking and off-chain c
 ```text
 I am developing the blockchain and off-chain storage layer of my project in the `src/blockchain/` directory. We need to track client reputations on an Ethereum testnet but store PyTorch gradients off-chain in Redis (to avoid massive gas costs).
 
-Please write the following three files:
+Please write the following four files:
 
 1. `src/blockchain/contracts/ReputationManager.sol`: A Hardhat/Solidity contract mapping a client's Ethereum address to a struct containing `int reputationScore`, `string gradientCidHash`, and recent update `metadata` (loss, magnitude). Only an 'Admin' address can update the scores.
-2. `src/blockchain/storage_utils.py`: A Python script containing two functions. `upload_tensor_to_redis(tensor_list)` that serializes PyTorch parameters to bytes, saves it in a local Redis dictionary with a unique UUID key, and returns the key. And `download_tensor_from_redis(key)` to retrieve it.
-3. `src/blockchain/web3_utils.py`: A Web3.py wrapper that connects to a local Hardhat node (http://127.0.0.1:8545), loads the `ReputationManager` ABI, and provides Python functions like `update_client_score(address, score, cid)` and `get_client_score(address)`.
+2. `src/blockchain/scripts/deploy.py`: A Python script using `web3.py` (or brownie/forge) to compile and deploy `ReputationManager.sol` to the local node, outputting the deployed contract address and ABI to a JSON file.
+3. `src/blockchain/storage_utils.py`: A Python script containing two functions. `upload_tensor_to_redis(tensor_list)` that serializes PyTorch parameters to bytes, saves it in a local Redis dictionary with a unique UUID key, and returns the key. And `download_tensor_from_redis(key)` to retrieve it.
+4. `src/blockchain/web3_utils.py`: A Web3.py wrapper that connects to a local Hardhat node (http://127.0.0.1:8545), loads the deployed `ReputationManager` ABI, and provides Python functions like `update_client_score(address, score, cid)` and `get_client_score(address)`.
 ```
 
 ---
