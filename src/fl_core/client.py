@@ -13,13 +13,16 @@ Dependencies:
 
 from __future__ import annotations
 
+import gc
 import logging
 from collections import OrderedDict
 from typing import Literal
 
 import numpy as np
 import torch
+import torch.amp
 import torch.nn as nn
+import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 
 from flwr.client import NumPyClient
@@ -42,6 +45,11 @@ MaliciousType = Literal["none", "label_flipper", "noise_injector"]
 LOCAL_EPOCHS: int = 1
 LEARNING_RATE: float = 0.01
 NOISE_SCALE: float = 10.0  # Gaussian noise std for noise_injector clients
+
+# cudnn.benchmark lets cuDNN auto-select the fastest convolution algorithm for
+# the fixed input sizes used in FEMNIST (28x28).  Set once at module load.
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +81,11 @@ class FlowerClient(NumPyClient):
         Numeric identifier for this client (used in logging).
     device : torch.device | None
         Device to train on. Defaults to CUDA if available, else CPU.
+    use_gradient_checkpointing : bool
+        When True, applies ``torch.utils.checkpoint.checkpoint_sequential``
+        to the convolutional feature extractor during training.  This trades
+        ~30% more compute for a significant reduction in activation memory,
+        which is valuable when simulating many clients concurrently.
     """
 
     def __init__(
@@ -83,6 +96,7 @@ class FlowerClient(NumPyClient):
         malicious_type: MaliciousType = "none",
         client_id: int = 0,
         device: torch.device | None = None,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -94,6 +108,15 @@ class FlowerClient(NumPyClient):
         )
         self.model.to(self.device)
 
+        # Mixed-precision training support (CUDA only)
+        self._use_amp = self.device.type == "cuda"
+        self._grad_scaler = torch.amp.GradScaler("cuda") if self._use_amp else None
+
+        # Gradient checkpointing: recomputes activations on backward pass instead
+        # of storing them, trading ~30% extra compute for significantly lower
+        # peak activation memory — useful when 50-100 clients run concurrently.
+        self._use_gradient_checkpointing = use_gradient_checkpointing
+
         # For label flippers, wrap the train dataset transparently
         if malicious_type == "label_flipper":
             flipped_dataset = LabelFlippedDataset(train_loader.dataset)
@@ -102,6 +125,9 @@ class FlowerClient(NumPyClient):
                 batch_size=train_loader.batch_size or 32,
                 shuffle=True,
                 drop_last=False,
+                pin_memory=True,
+                num_workers=2,
+                prefetch_factor=2,
             )
             logger.info("Client %d: label_flipper — labels shifted by +1", client_id)
         else:
@@ -120,9 +146,16 @@ class FlowerClient(NumPyClient):
     # ------------------------------------------------------------------
 
     def get_parameters(self, config: dict[str, Scalar]) -> NDArrays:
-        """Return current model parameters as a list of NumPy arrays."""
+        """Return current model parameters as a list of NumPy arrays.
+
+        Uses ``detach().cpu()`` before ``.numpy()`` to avoid holding a reference
+        to the computation graph and to ensure the tensor is on CPU memory
+        before the zero-copy numpy view is created.
+        """
         return [
-            val.cpu().numpy()
+            # detach() drops grad_fn before moving to CPU, preventing accidental
+            # graph retention; contiguous() ensures the numpy view is valid
+            val.detach().cpu().contiguous().numpy()
             for _, val in self.model.state_dict().items()
         ]
 
@@ -135,7 +168,7 @@ class FlowerClient(NumPyClient):
                 f"model expects {len(state_keys)}"
             )
         state_dict = OrderedDict(
-            {k: torch.tensor(v) for k, v in zip(state_keys, parameters)}
+            {k: torch.as_tensor(v, device=self.device) for k, v in zip(state_keys, parameters)}
         )
         self.model.load_state_dict(state_dict, strict=True)
 
@@ -173,6 +206,13 @@ class FlowerClient(NumPyClient):
             self._inject_noise()
 
         updated_params = self.get_parameters(config={})
+
+        # Reclaim fragmented CUDA memory after each FL round.  With 50-100
+        # concurrent clients each holding optimizer states and activations,
+        # accumulated fragmentation causes OOM before physical memory is full.
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
 
         metrics: dict[str, Scalar] = {
             "client_id": self.client_id,
@@ -228,29 +268,82 @@ class FlowerClient(NumPyClient):
         total_samples = 0
 
         for epoch in range(epochs):
-            epoch_loss = 0.0
+            running_loss = torch.tensor(0.0, device=self.device)
             batch_count = 0
             for images, labels in self.train_loader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
 
                 optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
 
-                epoch_loss += loss.item()
+                if self._use_amp:
+                    with torch.amp.autocast(device_type="cuda"):
+                        if self._use_gradient_checkpointing:
+                            # checkpoint_sequential recomputes activations during
+                            # backward instead of storing them, reducing peak
+                            # activation memory at ~30% extra FLOPs cost.
+                            # Segment count=2 splits conv1→pool and conv2→pool.
+                            conv_seq = nn.Sequential(
+                                self.model.conv1,
+                                nn.ReLU(),
+                                self.model.pool,
+                                self.model.conv2,
+                                nn.ReLU(),
+                                self.model.pool,
+                            )
+                            features = torch.utils.checkpoint.checkpoint_sequential(
+                                conv_seq, segments=2, input=images,
+                                use_reentrant=False,
+                            )
+                            features = features.view(features.size(0), -1)
+                            features = self.model.dropout(
+                                torch.nn.functional.relu(self.model.fc1(features))
+                            )
+                            outputs = self.model.fc2(features)
+                        else:
+                            outputs = self.model(images)
+                        loss = criterion(outputs, labels)
+                    self._grad_scaler.scale(loss).backward()
+                    self._grad_scaler.step(optimizer)
+                    self._grad_scaler.update()
+                else:
+                    if self._use_gradient_checkpointing:
+                        conv_seq = nn.Sequential(
+                            self.model.conv1,
+                            nn.ReLU(),
+                            self.model.pool,
+                            self.model.conv2,
+                            nn.ReLU(),
+                            self.model.pool,
+                        )
+                        features = torch.utils.checkpoint.checkpoint_sequential(
+                            conv_seq, segments=2, input=images,
+                            use_reentrant=False,
+                        )
+                        features = features.view(features.size(0), -1)
+                        features = self.model.dropout(
+                            torch.nn.functional.relu(self.model.fc1(features))
+                        )
+                        outputs = self.model.fc2(features)
+                    else:
+                        outputs = self.model(images)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+
+                running_loss += loss.detach()
                 batch_count += 1
                 total_samples += len(images)
 
             if batch_count > 0:
+                # Single GPU->CPU sync per epoch instead of per batch
+                epoch_loss = running_loss.item() / batch_count
                 logger.debug(
                     "Client %d epoch %d/%d — avg loss: %.4f",
                     self.client_id,
                     epoch + 1,
                     epochs,
-                    epoch_loss / batch_count,
+                    epoch_loss,
                 )
 
         return total_samples
@@ -259,7 +352,7 @@ class FlowerClient(NumPyClient):
         """Add massive Gaussian noise to all model parameters (noise_injector attack)."""
         with torch.no_grad():
             for param in self.model.parameters():
-                param.data += torch.randn_like(param.data) * NOISE_SCALE
+                param.data.add_(torch.randn_like(param.data), alpha=NOISE_SCALE)
         logger.debug(
             "Client %d: injected Gaussian noise (std=%.1f) into %d parameter tensors",
             self.client_id,
@@ -283,8 +376,9 @@ class FlowerClient(NumPyClient):
         total = 0
 
         for images, labels in self.test_loader:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
+            # non_blocking=True overlaps H2D transfer with prior GPU work
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
 
             outputs = self.model(images)
             total_loss += criterion(outputs, labels).item()

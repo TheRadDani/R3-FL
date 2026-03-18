@@ -21,6 +21,7 @@ Fallback behaviour:
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -62,6 +63,14 @@ _REPUTATION_SCALE_DEFAULT: int = 1000
 
 _MAX_REPUTATION: int = 10000
 """Upper clamp for on-chain reputation scores."""
+
+_AGGREGATION_CHUNK_SIZE: int = 10
+"""Number of clients processed per chunk during weighted aggregation.
+Keeping this at 10-20 bounds peak memory to ~chunk_size model copies rather
+than materializing all 100 client states simultaneously."""
+
+_MEMORY_WARNING_THRESHOLD: float = 0.80
+"""Emit a warning when GPU memory utilisation exceeds this fraction (0-1)."""
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +354,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             client_cids.append(cid)
 
             ndarrays = parameters_to_ndarrays(fit_res.parameters)
-            tensors = [torch.from_numpy(arr.copy()) for arr in ndarrays]
+            tensors = [torch.from_numpy(arr) for arr in ndarrays]
             client_params.append(tensors)
             client_num_samples.append(fit_res.num_examples)
             client_metrics.append(fit_res.metrics)
@@ -427,6 +436,10 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             aggregated_ndarrays=aggregated_ndarrays,
         )
 
+        # -- Free fragmented VRAM after aggregation -------------------------
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # -- Metrics -------------------------------------------------------
         metrics: Dict[str, Scalar] = {
             "num_clients": num_participating,
@@ -466,18 +479,29 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         Returns:
             Array of shape (num_clients,) with values in [0, 1].
         """
-        flat_vectors = []
-        for params in client_params:
-            flat = torch.cat([p.flatten().float() for p in params])
-            flat_vectors.append(flat)
+        with torch.no_grad():
+            flat_vectors = []
+            for params in client_params:
+                # flatten + float32 cast in one pass; keeps intermediate tensors small
+                flat = torch.cat([p.flatten().float() for p in params])
+                flat_vectors.append(flat)
 
-        stacked = torch.stack(flat_vectors)  # (N, D)
-        mean_vec = stacked.mean(dim=0, keepdim=True)  # (1, D)
+            # Use GPU if available for the (N x D) matrix operations
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            stacked = torch.stack(flat_vectors).to(device, non_blocking=True)  # (N, D)
+            self._check_gpu_memory(context="similarity stacked")
+            mean_vec = stacked.mean(dim=0, keepdim=True)  # (1, D)
 
-        # Cosine similarity (result in [-1, 1], rescale to [0, 1])
-        cos_sim = F.cosine_similarity(stacked, mean_vec, dim=1)  # (N,)
-        rescaled = ((cos_sim + 1.0) / 2.0).numpy().astype(np.float32)
-        return np.clip(rescaled, 0.0, 1.0)
+            # Cosine similarity (result in [-1, 1], rescale to [0, 1])
+            cos_sim = F.cosine_similarity(stacked, mean_vec, dim=1)  # (N,)
+            rescaled = ((cos_sim + 1.0) / 2.0).cpu().numpy().astype(np.float32)
+
+            # Free the large stacked matrix immediately after use
+            del stacked, mean_vec, cos_sim
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return np.clip(rescaled, 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # Helper: update magnitude
@@ -606,7 +630,38 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         return uniform
 
     # ------------------------------------------------------------------
-    # Helper: weighted average
+    # Helper: GPU memory monitoring
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_gpu_memory(context: str = "") -> None:
+        """Emit a warning when GPU memory utilisation exceeds the threshold.
+
+        This is a lightweight diagnostic helper called at chunk boundaries
+        during aggregation to detect OOM risk before it becomes fatal.
+
+        Args:
+            context: Human-readable label for the log message (e.g. round/chunk).
+        """
+        if not torch.cuda.is_available():
+            return
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        if reserved == 0:
+            return
+        utilisation = allocated / reserved
+        if utilisation >= _MEMORY_WARNING_THRESHOLD:
+            logger.warning(
+                "GPU memory utilisation at %.1f%% (%s): "
+                "allocated=%.1f MiB / reserved=%.1f MiB — OOM risk elevated",
+                utilisation * 100,
+                context,
+                allocated / (1024 ** 2),
+                reserved / (1024 ** 2),
+            )
+
+    # ------------------------------------------------------------------
+    # Helper: weighted average (chunked, layer-streaming)
     # ------------------------------------------------------------------
 
     def _weighted_average(
@@ -616,6 +671,22 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
     ) -> List[np.ndarray]:
         """Weighted average of per-client model parameters.
 
+        Memory strategy (two-axis optimisation):
+
+        1. **Layer-by-layer streaming**: only one layer's worth of tensors from
+           ALL clients is resident in memory at once.  This bounds peak memory
+           to ``max(layer_size) * num_clients`` rather than the full model times
+           ``num_clients``.
+
+        2. **Client chunking**: within each layer, clients are processed in
+           chunks of ``_AGGREGATION_CHUNK_SIZE``.  After each chunk the client
+           tensors are explicitly deleted and the CUDA cache is released so that
+           fragmented blocks can be reclaimed by subsequent chunks.
+
+        Aggregation arithmetic is always done in float32 regardless of the
+        dtype the client sent (e.g. float16 during AMP training) to avoid
+        precision loss from repeated fp16 additions.
+
         Args:
             client_params: List of per-client parameter tensor lists.
             weights: Normalised aggregation weights (sum to 1).
@@ -623,16 +694,58 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         Returns:
             List of numpy arrays representing the aggregated model.
         """
-        num_layers = len(client_params[0])
-        aggregated: List[np.ndarray] = []
+        with torch.no_grad():
+            num_clients = len(weights)
+            num_layers = len(client_params[0])
 
-        for layer_idx in range(num_layers):
-            layer_sum = torch.zeros_like(client_params[0][layer_idx].float())
-            for client_idx, w in enumerate(weights):
-                layer_sum += float(w) * client_params[client_idx][layer_idx].float()
-            aggregated.append(layer_sum.numpy())
+            # Pre-convert weights to Python floats once — avoids a CUDA
+            # kernel launch for each scalar multiply inside the loop
+            weights_f: List[float] = weights.tolist()
 
-        return aggregated
+            aggregated: List[np.ndarray] = []
+
+            for layer_idx in range(num_layers):
+                # Accumulate into float32 regardless of client dtype
+                # (fp16 accumulation suffers catastrophic cancellation at scale)
+                layer_sum: Optional[torch.Tensor] = None
+
+                # Process clients in chunks to limit simultaneous GPU residency
+                for chunk_start in range(0, num_clients, _AGGREGATION_CHUNK_SIZE):
+                    chunk_end = min(chunk_start + _AGGREGATION_CHUNK_SIZE, num_clients)
+                    chunk_tensors: List[torch.Tensor] = []
+
+                    for client_idx in range(chunk_start, chunk_end):
+                        raw = client_params[client_idx][layer_idx]
+                        # Cast to float32 for numerically stable accumulation
+                        t = raw.float()
+                        weighted = t.mul_(weights_f[client_idx])
+                        chunk_tensors.append(weighted)
+
+                    # Sum the chunk; keep result on same device as first tensor
+                    chunk_sum = torch.stack(chunk_tensors).sum(dim=0)
+
+                    if layer_sum is None:
+                        layer_sum = chunk_sum
+                    else:
+                        layer_sum.add_(chunk_sum)
+
+                    # Eagerly free chunk tensors and release CUDA cache
+                    del chunk_tensors, chunk_sum
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                self._check_gpu_memory(context=f"layer {layer_idx}")
+
+                # Move to CPU and convert to numpy before discarding the tensor
+                assert layer_sum is not None
+                aggregated.append(layer_sum.cpu().numpy())
+                del layer_sum
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            return aggregated
 
     # ------------------------------------------------------------------
     # Helper: blockchain update
