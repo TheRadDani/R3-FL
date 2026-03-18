@@ -11,7 +11,7 @@ Dependencies: src/fl_core/{dataset,client}.py, src/integration/strategy.py
 """
 from __future__ import annotations
 
-import argparse, json, logging, os, random, sys
+import argparse, gc, json, logging, os, random, sys
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -45,7 +45,7 @@ AVAILABLE_STRATEGIES = [
     "fedavg", "krum", "median", "trimmed_mean", "fltrust", "rl_reputation",
 ]
 DEFAULTS = dict(
-    num_rounds=50, num_clients=100, malicious_fraction=0.3,
+    num_rounds=5, num_clients=100, malicious_fraction=0.3,
     fraction_fit=0.1, target_accuracy=0.7, seed=42,
     trimmed_beta=0.1, batch_size=32, dirichlet_alpha=0.5,
 )
@@ -597,6 +597,12 @@ def main():
                             sn, fa, r.get("convergence_round", "N/A"))
         except Exception:
             logger.exception("Strategy '%s' failed, skipping.", sn)
+
+        # Free Python objects and clear GPU VRAM between strategy runs to
+        # prevent memory fragmentation when benchmarking sequentially.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     logger.info("=" * 60)
     logger.info("BENCHMARK SUMMARY")
