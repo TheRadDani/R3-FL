@@ -1,0 +1,21 @@
+# Machine Learning & Federated Learning
+torch
+torchvision
+flwr
+numpy
+
+# Reinforcement Learning
+ray[rllib]
+gymnasium
+
+# Blockchain & Off-chain Storage
+web3
+redis
+
+# Visualization & Utilities
+matplotlib
+pytest
+
+# Documentation
+sphinx
+sphinx-rtd-theme
