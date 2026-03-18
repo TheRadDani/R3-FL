@@ -12,7 +12,7 @@ Used by:
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Iterator, Optional
 
 import numpy as np
 import torch
@@ -33,6 +33,11 @@ IMAGE_SIZE: int = 28
 DEFAULT_NUM_CLIENTS: int = 100
 DEFAULT_DIRICHLET_ALPHA: float = 0.5
 DEFAULT_BATCH_SIZE: int = 32
+
+# Number of background workers for DataLoader I/O
+_DATALOADER_NUM_WORKERS: int = 2
+# How many batches to prefetch ahead per worker
+_DATALOADER_PREFETCH_FACTOR: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -206,18 +211,34 @@ def create_client_dataloaders(
     if not partition_indices:
         logger.warning("Creating DataLoader with empty partition — client has no data")
 
+    _cuda_available = torch.cuda.is_available()
+
     train_subset = Subset(train_dataset, partition_indices)
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=False,
+        # pin_memory enables async CPU→GPU DMA transfer via page-locked host memory
+        pin_memory=_cuda_available,
+        num_workers=_DATALOADER_NUM_WORKERS,
+        # prefetch_factor: each worker pre-fetches this many batches ahead of consumption
+        prefetch_factor=_DATALOADER_PREFETCH_FACTOR if _DATALOADER_NUM_WORKERS > 0 else None,
+        # persistent_workers keeps worker processes alive between rounds, avoiding
+        # the fork/join overhead that dominates multi-worker startup time
+        persistent_workers=_DATALOADER_NUM_WORKERS > 0,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
+        # pin_memory enables async CPU→GPU DMA transfer via page-locked host memory
+        pin_memory=_cuda_available,
+        num_workers=_DATALOADER_NUM_WORKERS,
+        prefetch_factor=_DATALOADER_PREFETCH_FACTOR if _DATALOADER_NUM_WORKERS > 0 else None,
+        # persistent_workers avoids worker respawn between evaluation calls
+        persistent_workers=_DATALOADER_NUM_WORKERS > 0,
     )
     return train_loader, test_loader
 
@@ -251,6 +272,88 @@ class LabelFlippedDataset(Dataset):
         image, label = self.base_dataset[idx]
         flipped_label = (label + 1) % self.num_classes
         return image, flipped_label
+
+
+# ---------------------------------------------------------------------------
+# PrefetchLoader: overlaps CPU→GPU transfer with GPU computation
+# ---------------------------------------------------------------------------
+
+
+class PrefetchLoader:
+    """Wraps a DataLoader to overlap CPU→GPU memory transfer with GPU compute.
+
+    On CUDA devices the next batch is transferred to GPU memory asynchronously
+    (via a non-blocking copy on a dedicated CUDA stream) while the current
+    batch is being processed.  This eliminates PCIe transfer latency from the
+    critical path.
+
+    On CPU-only machines this class is a transparent passthrough with no
+    overhead.
+
+    Parameters
+    ----------
+    loader : DataLoader
+        The underlying DataLoader to wrap.
+    device : torch.device
+        Target device.  When ``device.type != 'cuda'`` the wrapper is a no-op.
+
+    Example
+    -------
+    >>> loader = DataLoader(dataset, batch_size=32, pin_memory=True)
+    >>> fast_loader = PrefetchLoader(loader, device=torch.device("cuda"))
+    >>> for images, labels in fast_loader:
+    ...     # images and labels are already on GPU
+    ...     pass
+    """
+
+    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+        self.loader = loader
+        self.device = device
+        # Only meaningful on CUDA; CPU path is a passthrough
+        self._use_prefetch = device.type == "cuda"
+
+    def __len__(self) -> int:
+        return len(self.loader)  # type: ignore[arg-type]
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        if not self._use_prefetch:
+            # CPU path: yield batches directly, move to device synchronously
+            for batch in self.loader:
+                images, labels = batch
+                yield images.to(self.device), labels.to(self.device)
+            return
+
+        # CUDA path: dedicated stream for async H2D transfers
+        stream = torch.cuda.Stream()
+        loader_iter = iter(self.loader)
+
+        # Seed the pipeline with the first batch
+        try:
+            images, labels = next(loader_iter)
+        except StopIteration:
+            return
+
+        # Pre-fetch first batch onto GPU asynchronously
+        with torch.cuda.stream(stream):
+            # non_blocking=True: returns immediately; transfer happens in background
+            next_images = images.to(self.device, non_blocking=True)
+            next_labels = labels.to(self.device, non_blocking=True)
+
+        for batch in loader_iter:
+            # Yield the already-transferred batch (compute can overlap next H2D)
+            torch.cuda.current_stream().wait_stream(stream)
+            current_images, current_labels = next_images, next_labels
+
+            images, labels = batch
+            with torch.cuda.stream(stream):
+                next_images = images.to(self.device, non_blocking=True)
+                next_labels = labels.to(self.device, non_blocking=True)
+
+            yield current_images, current_labels
+
+        # Yield the final prefetched batch
+        torch.cuda.current_stream().wait_stream(stream)
+        yield next_images, next_labels
 
 
 # ---------------------------------------------------------------------------
