@@ -26,13 +26,26 @@ from flwr.common import Context
 from flwr.server import ServerConfig
 from flwr.server.strategy import FedAvg
 
-from .dataset import (
-    FemnistCNN,
-    create_client_dataloaders,
-    load_femnist,
-    partition_dataset_dirichlet,
-)
-from .client import FlowerClient, MaliciousType
+try:
+    from .dataset import (
+        FemnistCNN,
+        create_client_dataloaders,
+        load_femnist,
+        partition_dataset_dirichlet,
+    )
+    from .client import FlowerClient, MaliciousType
+except ImportError:
+    # Allow running as `python src/fl_core/server.py` from project root
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.fl_core.dataset import (
+        FemnistCNN,
+        create_client_dataloaders,
+        load_femnist,
+        partition_dataset_dirichlet,
+    )
+    from src.fl_core.client import FlowerClient, MaliciousType
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +70,30 @@ DATA_DIR: str = "./data"
 DIRICHLET_ALPHA: float = 0.5
 BATCH_SIZE: int = 32
 RANDOM_SEED: int = 42
+
+
+# ---------------------------------------------------------------------------
+# GPU resource detection
+# ---------------------------------------------------------------------------
+
+def _get_client_resources() -> dict:
+    """Return Ray client resources based on GPU availability.
+
+    Each simulated client gets 1 CPU. If a CUDA GPU is available, clients
+    share it — Ray allocates ``1 / num_gpus`` fraction per client so all 100
+    can run concurrently on a single GPU using time-slicing.
+    """
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        gpu_fraction = 1.0 / num_gpus  # one full GPU shared across clients
+        logger.info(
+            "GPU detected: %d device(s). Allocating %.4f GPU fraction per client.",
+            num_gpus,
+            gpu_fraction,
+        )
+        return {"num_cpus": 1, "num_gpus": gpu_fraction}
+    logger.info("No GPU detected — running on CPU.")
+    return {"num_cpus": 1, "num_gpus": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +235,7 @@ def run_simulation(
     data_dir: str = DATA_DIR,
     alpha: float = DIRICHLET_ALPHA,
     seed: int = RANDOM_SEED,
+    gpu_fraction: float | None = None,
 ) -> fl.server.history.History:
     """Run the full Flower federated learning simulation.
 
@@ -213,6 +251,10 @@ def run_simulation(
         Dirichlet concentration parameter for non-IID partitioning.
     seed : int
         Random seed for reproducibility.
+    gpu_fraction : float | None
+        GPU fraction to allocate per client in the Ray simulation. When
+        ``None`` (default), :func:`_get_client_resources` auto-detects GPU
+        availability. Pass an explicit value (e.g. ``0.1``) to override.
 
     Returns
     -------
@@ -270,7 +312,11 @@ def run_simulation(
         num_clients=num_clients,
         config=ServerConfig(num_rounds=num_rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0},
+        client_resources=(
+            {"num_cpus": 1, "num_gpus": gpu_fraction}
+            if gpu_fraction is not None
+            else _get_client_resources()
+        ),
     )
 
     # ---- 6. Log results --------------------------------------------------
