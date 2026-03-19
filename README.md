@@ -2,233 +2,723 @@
 
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
-[![Flower](https://img.shields.io/badge/Federated-Flower-F1C40F.svg)](https://flower.dev/)
-[![Ethereum](https://img.shields.io/badge/Network-Ethereum-3C3C3D.svg?logo=ethereum)](https://ethereum.org/)
+[![Flower](https://img.shields.io/badge/Federated_Learning-Flower-F1C40F.svg)](https://flower.dev/)
 [![Ray RLlib](https://img.shields.io/badge/RL-Ray_RLlib-028CF0.svg)](https://docs.ray.io/en/latest/rllib/index.html)
+[![Ethereum](https://img.shields.io/badge/Blockchain-Ethereum-3C3C3D.svg?logo=ethereum)](https://ethereum.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-339933.svg?logo=node.js)](https://nodejs.org/)
+[![License](https://img.shields.io/badge/license-Research-lightgrey.svg)](#license)
 
-A novel research architecture bridging **Federated Learning (FL)**, **Deep Reinforcement Learning (DRL)**, and **Blockchain**. R3-FL uses Proximal Policy Optimization (PPO) to autonomously learn and assign dynamic trust/reputation scores to edge clients, while leveraging Blockchain as an immutable reputation ledger and off-chain storage (Redis/IPFS) for model gradients.
-
----
-
-## 📖 Theoretical Foundations
-
-Traditional FL approaches—even robust ones like Krum or Trimmed Mean—rely on static mathematical thresholds to filter out malicious gradients. Adversaries constantly evolve to bypass these static rules (e.g., synchronized Sybil attacks or subtle gradient noise).
-
-**Our Hypothesis:** By using an AI Agent (PPO) working inside the central aggregator, the server can dynamically learn to identify adversarial patterns over time.
-
-### The Reward Function
-The Agent observes the network and outputs continuous aggregation weights $w_i \in [0, 1]$. It receives a reward $R$ based on the success of the global model after aggregation:
-
-$$R = \alpha \cdot (\text{Weighted Accuracy}) - \beta \cdot (\text{Malicious Impact}) - \gamma \cdot (\text{Entropy/Instability Penalty})$$
-
-### The Agent's State Vector
-For $N$ clients, the agent observes an $N \times 5$ property matrix:
-
-| Feature | Description |
-|---|---|
-| **Accuracy Contribution** | The marginal improvement the client provides on a validation set |
-| **Gradient Similarity** | Cosine similarity of the client's gradients relative to the global mean |
-| **Historical Reputation** | EMA of the client's score, fetched immutably from the blockchain |
-| **Loss Improvement** | Reduction in objective function loss |
-| **Update Magnitude** | L2 Norm of the client gradient update |
+> A research framework that uses a PPO reinforcement learning agent as a dynamic, self-learning trust arbiter inside a federated learning aggregation server, backed by an on-chain Ethereum reputation ledger.
 
 ---
 
-## 🏗️ System Architecture
+## Overview
+
+Traditional federated learning defenses against poisoning attacks — Krum, coordinate-wise Median, Trimmed Mean — rely on static mathematical rules. Adversaries learn to evade them. R3-FL replaces static rules with a trained Proximal Policy Optimization (PPO) agent that observes per-client behavioral signals each round and outputs continuous aggregation weights. The agent learns over time which clients are trustworthy, adapting to adversarial strategies that static methods cannot detect.
+
+The system consists of three tightly integrated layers:
+
+1. **Federated Learning core** (Flower): A simulation of up to 100 clients training a CNN on FEMNIST. Clients may be honest, label-flipping, or noise-injecting. The server uses one of six pluggable aggregation strategies.
+
+2. **Reinforcement Learning agent** (Ray RLlib / PPO): A custom Gymnasium environment (`FLReputationEnv`) models one FL aggregation round as a single RL step. The agent observes a 100×5 feature matrix per round and outputs a 100-dimensional weight vector. It is trained offline, then loaded as a frozen policy at FL simulation time.
+
+3. **Blockchain reputation ledger** (Ethereum / Hardhat): A Solidity smart contract (`ReputationManager`) stores every client's integer reputation score, gradient content-ID hash, and timestamp immutably on-chain. Redis stores the actual serialized model tensors off-chain; only the UUID key is committed on-chain to avoid gas costs for large payloads.
+
+### Hypothesis
+
+An AI agent running inside the aggregation server can learn to distinguish adversarial gradient updates from honest ones purely from behavioral signals, without prior knowledge of which clients are malicious — and can do so more robustly than static approaches as attacks evolve.
+
+---
+
+## Algorithm
+
+### State Vector
+
+At each communication round the RL agent receives an observation matrix of shape `(100, 5)` — one row per client, five features per client:
+
+| Feature index | Name | Description |
+|---|---|---|
+| 0 | `accuracy_contribution` | Marginal improvement to the global model on a held-out validation set |
+| 1 | `gradient_similarity` | Cosine similarity of the client's flattened gradient vs. the mean gradient, rescaled to [0, 1] |
+| 2 | `historical_reputation` | Exponential moving average (α=0.3) of past reputation, fetched from the blockchain |
+| 3 | `loss_improvement` | Reduction in the global loss attributable to this client's update |
+| 4 | `update_magnitude` | L2 norm of the gradient update, min-max normalized across all clients |
+
+### Reward Function
+
+```
+R = α · (weighted_accuracy) − β · (attack_impact) − γ · (entropy_penalty)
+```
+
+Where:
+- `weighted_accuracy` is the dot product of weights and per-client accuracy contributions, normalized by total weight.
+- `attack_impact` is the fraction of total aggregation weight assigned to clients whose ground-truth identity is malicious.
+- `entropy_penalty` (coefficient 0.05) gently penalizes uniform weight distributions, encouraging the agent to discriminate.
+- Default: α=0.6, β=0.4.
+
+### Aggregation Weights
+
+The PPO action space is `Box(0, 1, shape=(100,))`. The agent outputs a continuous weight per client. Weights for participating clients are extracted, clipped to [0, 1], and L1-normalized to sum to 1 before the weighted parameter average.
+
+### Reputation Update (EMA)
+
+After each round, on-chain reputation scores are updated:
+- Honest clients receiving high aggregation weight see their reputation increase.
+- Malicious clients receiving high weight see their reputation decrease (because the signal becomes "agent trusted a bad actor").
+
+EMA formula: `rep_new = (1 − 0.3) · rep_old + 0.3 · signal`
+
+---
+
+## Architecture
 
 ```mermaid
-graph TD
-    C1[Edge Client 1] -->|Local Training| OCS[(Redis / IPFS Off-chain Storage)]
-    C2[Edge Client 2] -->|Local Training| OCS
-    CN[Edge Client N] -->|Local Training| OCS
+flowchart TD
+    subgraph Clients["Edge Clients (up to 100)"]
+        C1["Client 0–14\n(label_flipper)"]
+        C2["Client 15–29\n(noise_injector)"]
+        C3["Client 30–99\n(honest)"]
+    end
 
-    OCS -->|CID Hash| SC{Ethereum Smart Contract}
+    subgraph OffChain["Off-Chain Storage"]
+        Redis[("Redis\nTensor Store")]
+    end
 
-    SC -->|Reputation History| S[FL Server - RLReputationStrategy]
+    subgraph OnChain["Ethereum (Hardhat)"]
+        SC["ReputationManager.sol\n(reputation scores + CID hashes)"]
+    end
 
-    S -->|State Vector| RLA((RLlib PPO Agent))
-    RLA -->|Weights w_i| S
+    subgraph Server["FL Server — RLReputationStrategy"]
+        FM["1. Receive FitRes\n(model updates)"]
+        BC["2. Fetch reputations\nfrom blockchain"]
+        SM["3. Build 100×5\nstate matrix"]
+        RL["4. PPO inference\n→ per-client weights"]
+        WA["5. Weighted average\n(chunked, float32)"]
+        BU["6. Update blockchain\n+ Redis"]
+    end
 
-    S -->|Weighted Aggregation| GM[Global Model Update]
-    GM -->|New Parameters| C1
-    GM -->|New Parameters| C2
-    GM -->|New Parameters| CN
-    S -->|Update Scores| SC
+    C1 -->|local gradients| Server
+    C2 -->|local gradients| Server
+    C3 -->|local gradients| Server
+
+    WA -->|aggregated model| Clients
+    BU -->|UUID key| Redis
+    BU -->|batchUpdateClients| SC
+    BC <-->|getClient| SC
+
+    FM --> BC --> SM --> RL --> WA --> BU
 ```
 
-### Attack Vectors Defended
-The system is tested against 20–40% malicious clients executing:
-- **Label Flipping (Data Poisoning):** Shifts training labels locally by +1 (mod num_classes).
-- **Gaussian Noise Injection:** Adds massive noise (std=10.0) to model parameter weights before uploading.
-- **Sybil Attacks:** Multiple fake clients submitting identical coordinated malicious updates.
+### Component Responsibilities
+
+| Component | File | Responsibility |
+|---|---|---|
+| `FemnistCNN` | `src/fl_core/dataset.py` | 2-layer CNN, 62-class FEMNIST classifier; shared architecture across all clients and server |
+| `FlowerClient` | `src/fl_core/client.py` | Honest or malicious Flower `NumPyClient`; executes local SGD with optional AMP and gradient checkpointing |
+| `FedAvg server` | `src/fl_core/server.py` | Baseline Flower simulation: 100 clients, 30% malicious (15 label flippers + 15 noise injectors), 10 rounds |
+| `FLReputationEnv` | `src/rl_agent/env.py` | Custom Gymnasium environment; one step = one FL round; reward = accuracy signal minus attack impact |
+| `train.py` | `src/rl_agent/train.py` | Ray RLlib PPO training loop; saves checkpoints to `checkpoints/fl_reputation_ppo/` |
+| `kernels.py` | `src/rl_agent/kernels.py` | Triton JIT kernel for reward normalization; graceful PyTorch fallback |
+| `ReputationManager.sol` | `src/blockchain/contracts/` | Solidity contract: admin-gated write, open read, batch update, `ClientUpdated` events |
+| `storage_utils.py` | `src/blockchain/storage_utils.py` | Redis upload/download for serialized tensors; zlib compression (level 1); UUID as CID key |
+| `web3_utils.py` | `src/blockchain/web3_utils.py` | web3.py wrapper: deploy, `updateClient`, `batchUpdateClients`, `getClient` |
+| `deploy.py` | `src/blockchain/scripts/deploy.py` | CLI script: deploys contract and writes `deployment.json` manifest |
+| `RLReputationStrategy` | `src/integration/strategy.py` | Flower `Strategy` subclass that ties FL + blockchain + PPO together; chunked memory-efficient aggregation |
+| `run_benchmarks.py` | `scripts/run_benchmarks.py` | Runs multiple strategies head-to-head under identical attack conditions; outputs per-strategy JSON results |
+
+### Attack Vectors Modeled
+
+| Attack | Implementation | Behavior |
+|---|---|---|
+| **Label Flipping** | `LabelFlippedDataset` wrapper | Shifts all training labels by +1 mod 62 before local training |
+| **Noise Injection** | `_inject_noise()` in `FlowerClient` | Adds Gaussian noise (std=10.0) to all model parameters after local training, before upload |
+| **Sybil** | Multiple clients submitting identical coordinated updates | Tested by configuring large malicious fractions with identical attack types |
 
 ---
 
-## 📁 Project Structure
+## Directory Structure
 
-```text
+```
 R3-FL/
 ├── src/
-│   ├── fl_core/                    # Federated Learning core
-│   │   ├── dataset.py              # FEMNIST (EMNIST byclass) loading, non-IID Dirichlet partitioning, CNN model
-│   │   ├── client.py               # Flower NumPyClient with malicious behaviors (label_flipper, noise_injector)
-│   │   └── server.py               # Flower server with FedAvg and robust baselines (Krum, Median, TrimmedMean)
+│   ├── fl_core/
+│   │   ├── dataset.py          # EMNIST byclass loading, Dirichlet partitioning, FemnistCNN, PrefetchLoader
+│   │   ├── client.py           # FlowerClient: honest / label_flipper / noise_injector
+│   │   └── server.py           # Baseline FL simulation (FedAvg, 100 clients, 10 rounds)
 │   │
-│   ├── blockchain/                 # Blockchain & off-chain storage layer
+│   ├── rl_agent/
+│   │   ├── env.py              # FLReputationEnv: Gymnasium env (obs=100×5, act=100-dim weights)
+│   │   ├── train.py            # PPO training loop via Ray RLlib; CLI with --iterations, --num-workers
+│   │   ├── kernels.py          # Triton reward-normalization kernel + PyTorch fallback + RunningMeanStd
+│   │   └── __init__.py
+│   │
+│   ├── blockchain/
 │   │   ├── contracts/
-│   │   │   └── ReputationManager.sol  # Solidity smart contract for on-chain reputation tracking
+│   │   │   └── ReputationManager.sol  # Solidity 0.8.19: on-chain reputation registry
 │   │   ├── scripts/
-│   │   │   └── deploy.py           # Python script to compile and deploy the contract via web3.py
-│   │   ├── storage_utils.py        # Redis-based off-chain gradient storage (serialize/deserialize PyTorch tensors)
-│   │   ├── web3_utils.py           # web3.py wrapper for reading/writing reputation scores on-chain
-│   │   ├── hardhat.config.ts       # Hardhat configuration for the local Ethereum node
-│   │   └── package.json            # Node.js dependencies for Hardhat/Solidity tooling
+│   │   │   └── deploy.py       # Python CLI: compile + deploy + write deployment.json
+│   │   ├── storage_utils.py    # Redis tensor upload/download with zlib compression
+│   │   ├── web3_utils.py       # web3.py: deploy, updateClient, batchUpdateClients, getClient
+│   │   ├── hardhat.config.ts   # Hardhat 3 configuration (Solidity 0.8.19, localhost network)
+│   │   ├── package.json        # Node.js deps: hardhat, viem, ethers
+│   │   └── README.md           # Hardhat project notes
 │   │
-│   ├── rl_agent/                   # Reinforcement Learning agent
-│   │   ├── env.py                  # Custom Gymnasium environment (FLReputationEnv) with 100x5 state matrix
-│   │   └── train.py                # Ray RLlib PPO training loop with checkpoint saving
-│   │
-│   └── integration/                # System integration
-│       └── strategy.py             # RLReputationStrategy: custom Flower Strategy combining FL + Blockchain + RL
+│   └── integration/
+│       └── strategy.py         # RLReputationStrategy: Flower Strategy integrating FL + blockchain + PPO
 │
-├── tests/                          # Pytest test suite
-│   ├── test_fl_core.py             # Tests for dataset partitioning, CNN model, and malicious client behavior
-│   ├── test_blockchain.py          # Tests for Redis storage and mocked web3 contract interactions
-│   └── test_rl_agent.py            # Tests for Gymnasium env spaces, reward computation, and PPO training
+├── tests/
+│   ├── test_fl_core.py         # Dataset partitioning, CNN forward pass, malicious client behavior
+│   ├── test_blockchain.py      # Redis round-trip, mocked web3 contract calls
+│   └── test_rl_agent.py        # Gymnasium env spaces, reward shape, PPO smoke test
 │
-├── docs/                           # Sphinx documentation source (RST + conf.py)
-├── data/                           # Auto-downloaded dataset cache (FEMNIST/EMNIST)
-├── scripts/                        # Utility scripts
-├── .github/workflows/docs.yml      # GitHub Actions: auto-build & deploy Sphinx docs to GitHub Pages
-├── pyproject.toml                  # Python package config (enables `pip install -e .`)
-└── requirements.txt                # Python dependencies
+├── docs/                       # Sphinx documentation source (RST + conf.py)
+├── data/                       # Auto-downloaded EMNIST dataset cache (created on first run)
+├── checkpoints/                # PPO training checkpoints (created by train.py)
+├── results/                    # Benchmark JSON output (created by run_benchmarks.py)
+├── scripts/
+│   └── run_benchmarks.py       # Head-to-head strategy benchmark runner
+├── deployment.json             # Written by deploy.py after contract deployment
+├── pyproject.toml              # Package metadata (name=r3-fl, requires-python>=3.10)
+├── requirements.txt            # Python dependencies
+└── .github/workflows/docs.yml  # GitHub Actions: build and deploy Sphinx docs to GitHub Pages
 ```
 
 ---
 
-## 🚀 Getting Started
+## Prerequisites
 
-### Prerequisites
-- **Python** 3.10+
-- **Node.js** v18+ (for Hardhat / Solidity compilation)
-- **Redis Server** (for off-chain gradient storage)
+| Dependency | Version | Purpose |
+|---|---|---|
+| Python | 3.10+ | Runtime |
+| Node.js | 18+ | Hardhat / Solidity toolchain |
+| Redis | 6+ | Off-chain gradient storage |
+| CUDA (optional) | 11.8+ | GPU acceleration for training and simulation |
 
-### 1. Clone & Install
+> **Hardware requirements for RL training:**
+> The default worker count is `max(4, cpu_count - 2)`. A machine with 8+ CPU cores and 16 GB RAM is sufficient for a minimal run.
+>
+> - **Multi-GPU server** (original target): All GPUs go to the learner; workers scale to CPU count. You can push `--num-workers` to 30+ if cores are available.
+> - **Single-GPU workstation** (e.g., laptop with RTX 4090): The default configuration works without changes — the learner uses the GPU for policy updates and workers run entirely on CPU. Recommended: keep `--num-workers` at or below `cpu_count - 2`.
+>
+> If you see Ray warnings such as `"Insufficient GPUs"` or tasks stuck in `PENDING` waiting for GPU resources, a prior version of the config was assigning fractional GPUs to workers. Ensure you are running the current `train.py` (workers use `num_gpus_per_env_runner=0`) or pass `--num-workers 4` to reduce scheduling pressure.
+
+---
+
+## Getting Started
+
+Follow these steps in order. You will need three terminals open by the end (Hardhat node, Redis, and your working shell).
+
+### Step 1 — Clone and install Python dependencies
 
 ```bash
 git clone https://github.com/TheRadDani/R3-FL.git
 cd R3-FL
 
-# Install Python dependencies
 pip install -r requirements.txt
 
-# Install the project as an editable package (required for `from src.*` imports)
+# Install as an editable package so `from src.*` imports resolve everywhere
 pip install -e .
 ```
 
-### 2. Start the Blockchain Layer
+The `pip install -e .` step is required. Without it, `from src.fl_core.dataset import ...` style imports fail when running scripts from the project root.
 
-**Terminal 1 — Start the local Ethereum node:**
+### Step 2 — Install Node.js dependencies and compile contracts
+
 ```bash
 cd src/blockchain
-npm install            # Install Hardhat and Solidity dependencies (first time only)
-npx hardhat node       # Starts a local Ethereum node on http://127.0.0.1:8545
+npm install          # first time only; installs Hardhat, viem, ethers
 ```
 
-**Terminal 2 — Deploy the Smart Contract:**
+Compile the Solidity contract:
+
 ```bash
-cd src/blockchain/scripts
-python deploy.py       # Compiles and deploys ReputationManager.sol, outputs deployment.json
+# Run this from src/blockchain/ where hardhat.config.ts lives
+npx hardhat compile --force
 ```
 
-### 3. Start Redis (Off-chain Storage)
+> **Note on compile output**: After the first successful compilation, Hardhat caches the compiled artifacts. On subsequent runs, `npx hardhat compile` (without `--force`) will print:
+> ```
+> Nothing to compile
+> ```
+> or
+> ```
+> No contracts to compile
+> ```
+> **This is normal and expected Hardhat v3 behavior** — it means the contracts are already compiled and the cache is fresh. Only run `--force` when you want to recompile from scratch (e.g., after editing the Solidity source). For deployment you just need the artifacts to exist, which they will after any successful compile.
 
-**Terminal 3:**
+Return to the project root for all subsequent steps:
+
 ```bash
+cd ../..
+```
+
+### Step 3 — Start the local Hardhat node
+
+Open a dedicated terminal and leave it running throughout your session:
+
+```bash
+# Terminal A — keep this running
+cd src/blockchain
+npx hardhat node
+```
+
+The node prints 20 pre-funded test accounts and listens at `http://127.0.0.1:8545`. Account 0 (`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`) is used as the contract admin by default.
+
+### Step 4 — Deploy the smart contract
+
+With the Hardhat node running, deploy from the project root:
+
+```bash
+# Terminal B (or your main shell) — run from R3-FL/
+python src/blockchain/scripts/deploy.py
+```
+
+Successful output:
+
+```
+[deploy] ReputationManager deployed at 0x5FbDB2315678afecb367f032d93F642f64180aa3
+[deploy] Manifest written to: /path/to/R3-FL/deployment.json
+```
+
+`deployment.json` is written to the project root. It contains the contract address, ABI, deployer address, and block number. The `web3_utils.py` module reads the contract address from this file automatically.
+
+If you see `ERROR: Hardhat artifact not found`, the compile step (Step 2) did not complete successfully — go back and run `npx hardhat compile --force`.
+
+If you see `ERROR: Could not connect to Hardhat node`, the node from Step 3 is not running.
+
+**Optional — override connection defaults with environment variables:**
+
+```bash
+export HARDHAT_RPC_URL="http://127.0.0.1:8545"   # default
+export CONTRACT_ADDRESS="0x5FbDB2315678..."        # from deployment.json
+export REDIS_HOST="localhost"                      # default
+export REDIS_PORT="6379"                          # default
+export REDIS_DB="0"                               # default
+```
+
+### Step 5 — Start Redis
+
+Open another dedicated terminal:
+
+```bash
+# Terminal C — keep this running
 redis-server --port 6379
 ```
 
-### 4. Train the RL Agent
+Verify it is running:
 
-**Terminal 4 — Train the PPO model:**
 ```bash
+redis-cli ping
+# PONG
+```
+
+### Step 6 — Train the PPO agent
+
+The RL agent must be trained before it can be used in the full FL simulation (`rl_reputation` strategy). The training runs entirely in the custom Gymnasium environment — no real FL simulation is needed at this stage.
+
+```bash
+python -m src.rl_agent.train
+# or equivalently:
 python src/rl_agent/train.py
 ```
-This will train the PPO agent for 50 iterations on the custom `FLReputationEnv` Gymnasium environment and save checkpoints locally.
 
-### 5. Run the Federated Learning Simulation
+**CLI flags:**
 
-**Terminal 5 — Run the FL server with the RL-based strategy:**
+| Flag | Default | Description |
+|---|---|---|
+| `--iterations` | `50` | Number of PPO training iterations |
+| `--num-workers` | auto | Parallel rollout workers (default: `max(4, cpu_count - 2)`) |
+| `--time-inference` | off | Wrap each iteration with CUDA synchronize timing to profile GPU bottlenecks |
+
+> **Single-GPU note:** The script auto-detects your CPU count and sets `num_env_runners` accordingly. Rollout workers run on CPU; only the learner process uses the GPU. On machines with fewer cores you can cap workers explicitly:
+> ```bash
+> python -m src.rl_agent.train --num-workers 4
+> ```
+> If Ray prints warnings about insufficient GPU resources, you are likely running an older version of `train.py` that assigned fractional GPUs to workers. The current version sets `num_gpus_per_env_runner=0` for all workers, which resolves this.
+
+**Examples:**
+
+```bash
+# Train for 200 iterations with explicit worker count
+python -m src.rl_agent.train --iterations 200 --num-workers 8
+
+# Train with CUDA timing diagnostics
+python -m src.rl_agent.train --iterations 50 --time-inference
+```
+
+**Output:** Checkpoints are saved every 10 iterations to `checkpoints/fl_reputation_ppo/`. The final checkpoint is always saved regardless of interval.
+
+**Training configuration (from `train.py`):**
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Algorithm | PPO | Proximal Policy Optimization |
+| Framework | PyTorch | Explicit; required for AMP |
+| Train batch size | 4000 steps | Reduce if GPU OOM |
+| SGD minibatch | 256 | Balances gradient noise and throughput |
+| SGD iterations | 10 per batch | |
+| Learning rate | 3e-4 | |
+| Discount (γ) | 0.99 | |
+| GAE (λ) | 0.95 | |
+| Clip parameter | 0.2 | PPO clip |
+| Network | [256, 256] FC | Shared trunk for policy and value heads |
+| Rollout fragment | 200 steps/worker | |
+| Evaluation interval | every 10 iterations | 5 episodes |
+
+The script auto-detects GPU resources. On CUDA machines, all GPUs are allocated to the learner; rollout workers run on CPU only (`num_gpus_per_env_runner=0`) to avoid Ray demanding more GPU budget than a single-GPU machine can supply.
+
+### Step 7 — Run the baseline FL simulation
+
+This runs FedAvg with 100 clients (15 label flippers + 15 noise injectors + 70 honest) for 10 communication rounds. No blockchain or RL agent is required.
+
 ```bash
 python src/fl_core/server.py
 ```
-The server uses the `RLReputationStrategy` (from `src/integration/strategy.py`) which:
-1. Receives client model updates via Flower.
-2. Fetches reputation history from the Blockchain.
-3. Constructs the 100×5 state matrix.
-4. Runs PPO inference to assign per-client aggregation weights.
-5. Performs weighted model averaging.
-6. Updates on-chain reputation scores.
+
+The EMNIST byclass dataset (~500 MB) is downloaded automatically to `./data/` on first run.
+
+**What happens:**
+
+1. Loads and partitions EMNIST across 100 clients using a Dirichlet distribution (α=0.5).
+2. Each round: samples 10% of clients for training, 5% for evaluation.
+3. Aggregates with standard FedAvg (no Byzantine robustness).
+4. Logs per-round centralized and distributed losses and accuracy.
+
+### Step 8 — Run the full R3-FL simulation with blockchain and RL
+
+Requires: Hardhat node running, contract deployed, Redis running, and a PPO checkpoint saved.
+
+```bash
+# Ensure PPO checkpoint exists
+ls checkpoints/fl_reputation_ppo/
+
+# Run the FL server using the RL-backed aggregation strategy
+# (currently invoked from server.py by swapping the strategy;
+#  or use run_benchmarks.py with --strategies rl_reputation)
+python scripts/run_benchmarks.py --strategies rl_reputation --num-rounds 10
+```
+
+The `RLReputationStrategy` performs these steps each round:
+
+1. Receives `FitRes` from all participating clients.
+2. Maps each Flower CID to a deterministic Ethereum address.
+3. Calls `getClient()` on `ReputationManager` to fetch historical reputation scores.
+4. Computes cosine gradient similarity and L2 magnitude for each client.
+5. Assembles the 100×5 state matrix (non-participating slots filled with 0.5).
+6. Calls `ppo_algo.compute_single_action(state)` to get a 100-dim weight vector.
+7. Performs weighted average of model parameters (chunked, 10 clients per chunk, float32 accumulation).
+8. Uploads the aggregated model to Redis; records the UUID key.
+9. Calls `batchUpdateClients()` on the contract to commit all reputation scores atomically.
+
+If the PPO checkpoint is unavailable or inference fails, the strategy falls back to uniform (FedAvg-style) weights and logs a warning.
 
 ---
 
-## 🧪 Running Tests
+## Running Benchmarks
+
+`scripts/run_benchmarks.py` is the primary evaluation tool. It runs one or more aggregation strategies under identical conditions and saves per-round metrics as JSON files.
+
+### Prerequisites
+
+Before launching the benchmark runner, verify the following are in place:
+
+| Requirement | When required | How to check |
+|---|---|---|
+| Hardhat node running at `http://127.0.0.1:8545` | Always (all strategies use blockchain state) | `curl -s -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'` |
+| `deployment.json` exists in project root | Always | `ls deployment.json` |
+| Redis running at `localhost:6379` | Always | `redis-cli ping` |
+| PPO checkpoint at `checkpoints/fl_reputation_ppo/` | Only when running `rl_reputation` strategy | `ls checkpoints/fl_reputation_ppo/` |
+
+If the Hardhat node is not running, start it first (`npx hardhat node` from `src/blockchain/`), then redeploy the contract (`python src/blockchain/scripts/deploy.py`). The contract address in `deployment.json` changes on every deployment — you must redeploy after restarting the node.
+
+If no PPO checkpoint exists and you include `rl_reputation` in `--strategies`, the script will raise a `RuntimeError` and skip that strategy. Train first:
 
 ```bash
-# Run all tests
+python -m src.rl_agent.train --iterations 50
+```
+
+### Usage
+
+```bash
+python scripts/run_benchmarks.py [OPTIONS]
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--strategies` | `all` | Space-separated strategy names, or `all` to run every strategy |
+| `--num-rounds` | `5` | Number of FL communication rounds per strategy |
+| `--num-clients` | `20` | Total number of simulated clients |
+| `--malicious-fraction` | `0.3` | Fraction of clients that are malicious (e.g., `0.3` = 30%) |
+| `--attack-type` | `label_flip` | Attack type: `label_flip` or `noise_inject` |
+| `--target-accuracy` | `0.7` | Accuracy threshold used to compute convergence round |
+| `--output-dir` | `results` | Directory where JSON result files are written |
+| `--seed` | `42` | Random seed for reproducibility (controls data partition and client assignment) |
+
+Available strategy names: `fedavg`, `krum`, `median`, `trimmed_mean`, `fltrust`, `rl_reputation`
+
+### Examples
+
+```bash
+# Compare FedAvg and Krum under label-flip attack, 20 rounds
+python scripts/run_benchmarks.py \
+    --strategies fedavg krum \
+    --num-rounds 20 \
+    --num-clients 20 \
+    --malicious-fraction 0.3 \
+    --attack-type label_flip
+
+# Full comparison of all strategies under noise injection
+python scripts/run_benchmarks.py \
+    --strategies all \
+    --num-rounds 50 \
+    --num-clients 50 \
+    --malicious-fraction 0.4 \
+    --attack-type noise_inject \
+    --output-dir results/noise_inject_50_clients
+
+# Quick smoke test (single strategy, 3 rounds, fewer clients)
+python scripts/run_benchmarks.py \
+    --strategies median \
+    --num-rounds 3 \
+    --num-clients 10 \
+    --malicious-fraction 0.2
+```
+
+### Output
+
+Each strategy produces a JSON file in `--output-dir`:
+
+```
+results/
+├── fedavg_metrics.json
+├── krum_metrics.json
+├── median_metrics.json
+├── trimmed_mean_metrics.json
+├── fltrust_metrics.json
+└── rl_reputation_metrics.json
+```
+
+Each file has this structure:
+
+```json
+{
+  "strategy": "krum",
+  "attack_type": "label_flip",
+  "malicious_fraction": 0.3,
+  "num_clients": 20,
+  "num_rounds": 5,
+  "rounds": [0, 1, 2, 3, 4],
+  "accuracy": [0.0, 0.12, 0.23, 0.31, 0.38],
+  "loss": [4.12, 3.87, 3.54, 3.20, 2.98],
+  "attack_success_rate": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "client_weights": [[0.0, 0.0, ..., 1.0, 0.0]],
+  "convergence_round": null,
+  "target_accuracy": 0.7
+}
+```
+
+`convergence_round` is the first round where accuracy exceeds `--target-accuracy`, or `null` if never reached.
+
+### Strategy Descriptions
+
+| Strategy | Class | Description |
+|---|---|---|
+| `fedavg` | `flwr.server.strategy.FedAvg` | Standard weighted average. Baseline — fails under attack. |
+| `krum` | `KrumStrategy` | Selects the single update with minimum sum of distances to its `n - f - 2` nearest neighbors. Requires known Byzantine count. |
+| `median` | `MedianStrategy` | Coordinate-wise median across all client updates. No weight output. |
+| `trimmed_mean` | `TrimmedMeanStrategy` | Removes the top and bottom `beta` (default 10%) fraction of values per coordinate before averaging. |
+| `fltrust` | `FLTrustStrategy` | Server trains on a 1% clean trust dataset, computes ReLU(cosine similarity) as trust scores, rescales client updates by server-update norm. |
+| `rl_reputation` | `RLReputationStrategy` | PPO agent derives weights from behavioral features + blockchain reputation history. |
+
+### Prerequisites for `rl_reputation`
+
+The `rl_reputation` strategy requires a trained PPO checkpoint. The script searches these paths in order:
+
+1. `checkpoints/fl_reputation_ppo`
+2. `checkpoints/ppo_latest`
+3. `checkpoints/ppo`
+4. `$PPO_CHECKPOINT_PATH` environment variable
+
+If no checkpoint is found, the strategy raises `RuntimeError` and is skipped. See the Prerequisites table above for how to train the agent before running this strategy.
+
+### Resource Management
+
+The benchmark runner manages memory explicitly between strategy runs:
+
+- Ray object store is capped at 2 GB (`object_store_memory`) to prevent default 30% RAM reservation.
+- GPU VRAM is cleared with `torch.cuda.empty_cache()` between strategies.
+- Python GC is called (`gc.collect()`) after each strategy to reclaim fragmented memory.
+- Per-client GPU fraction is computed as `num_gpus / num_concurrent_clients` to prevent Ray resource exhaustion.
+
+---
+
+## Running Tests
+
+```bash
+# Run the full test suite
 pytest tests/ -v
 
-# Run tests for a specific module
+# Run individual test modules
 pytest tests/test_fl_core.py -v
 pytest tests/test_blockchain.py -v
 pytest tests/test_rl_agent.py -v
 ```
 
+Tests cover:
+- `test_fl_core.py`: EMNIST loading, Dirichlet partitioning statistics, CNN forward pass, `LabelFlippedDataset` correctness, `FlowerClient` fit/evaluate API.
+- `test_blockchain.py`: Redis round-trip serialization/deserialization, mocked `web3.py` contract calls for `updateClient` and `getClient`.
+- `test_rl_agent.py`: Gymnasium observation/action space dtypes and shapes, reward computation correctness, reputation EMA update, PPO training smoke test.
+
 ---
 
-## 📊 Building Documentation
+## Building API Documentation
 
-API documentation is auto-generated from Python docstrings using **Sphinx**.
+Documentation is auto-generated from Python docstrings using Sphinx.
 
 ```bash
-# Local build
 cd docs
 make html
 # Open docs/_build/html/index.html in your browser
-
-# Or push to main to trigger automatic GitHub Pages deployment via .github/workflows/docs.yml
 ```
+
+Pushing to `main` triggers the GitHub Actions workflow at `.github/workflows/docs.yml`, which builds and deploys the documentation to GitHub Pages automatically.
 
 ---
 
-## 📐 Evaluation & Baselines
+## Smart Contract Reference
 
-The system is evaluated against the following baselines over 100–300 communication rounds with 50–100 clients (20–40% malicious):
+`ReputationManager.sol` (Solidity ^0.8.19) is deployed on the local Hardhat network.
+
+### Data Model
+
+```solidity
+struct ClientRecord {
+    int256  reputationScore;  // RL-assigned reputation; may be negative
+    string  gradientCidHash;  // Redis UUID key for latest serialized gradient tensors
+    uint256 loss;             // Loss-improvement metric (scaled by 1e18)
+    uint256 magnitude;        // L2 norm of gradient update (scaled by 1e18)
+    uint256 lastUpdated;      // block.timestamp of last write
+}
+```
+
+### Functions
+
+| Function | Access | Description |
+|---|---|---|
+| `updateClient(address, int256, string, uint256, uint256)` | admin only | Update a single client's full record |
+| `batchUpdateClients(address[], int256[], string[], uint256[], uint256[])` | admin only | Atomically update multiple clients in one transaction |
+| `getClient(address) → ClientRecord` | public view | Read a client's current record |
+| `transferAdmin(address)` | admin only | Transfer the admin role to a new address |
+
+### Events
+
+| Event | Emitted when |
+|---|---|
+| `ClientUpdated(address indexed client, int256 score, string cidHash)` | Any write to a client record |
+| `AdminTransferred(address indexed previousAdmin, address indexed newAdmin)` | Admin role transferred |
+
+### Accessing from Python
+
+The `web3_utils.py` module provides high-level wrappers:
+
+```python
+from src.blockchain.web3_utils import deploy_contract, update_client_score, get_client_score
+
+# Deploy (only needed once per Hardhat session)
+address = deploy_contract(account_index=0)
+
+# Write
+update_client_score(
+    client_address="0xAbCd...",
+    score=850,
+    cid="some-uuid-from-redis",
+    loss=0,
+    magnitude=0,
+)
+
+# Read
+record = get_client_score("0xAbCd...")
+# {"reputationScore": 850, "gradientCidHash": "some-uuid...", ...}
+```
+
+The contract address is resolved in this priority order:
+1. Explicit `contract_address` argument
+2. Module-level singleton set by `deploy_contract()`
+3. `CONTRACT_ADDRESS` environment variable
+
+---
+
+## Environment Variables Reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `HARDHAT_RPC_URL` | `http://127.0.0.1:8545` | Ethereum JSON-RPC endpoint |
+| `CONTRACT_ADDRESS` | *(none)* | Pre-deployed `ReputationManager` address (skips deployment) |
+| `REDIS_HOST` | `localhost` | Redis server hostname |
+| `REDIS_PORT` | `6379` | Redis server port |
+| `REDIS_DB` | `0` | Redis logical database index |
+| `PPO_CHECKPOINT_PATH` | *(none)* | Override checkpoint path for `rl_reputation` strategy in benchmarks |
+
+---
+
+## Evaluation Baselines
+
+The system is evaluated against the following baselines over 5–300 communication rounds with 10–100 clients and 20–40% malicious clients.
 
 | Strategy | Description |
 |---|---|
-| **FedAvg** | Standard weighted average (baseline — fails under attack) |
-| **Krum** | Selects the single update closest to most others |
-| **Median** | Coordinate-wise median of all updates |
-| **Trimmed Mean** | Removes top/bottom percentiles before averaging |
-| **FLTrust** | Server uses a trusted root dataset to bootstrap trust scores |
-| **R3-FL (Ours)** | PPO agent dynamically learns to weight clients based on behavior |
+| **FedAvg** | Standard weighted average — baseline, no attack resistance |
+| **Krum** | Euclidean-distance nearest-neighbor selection |
+| **Median** | Coordinate-wise median |
+| **Trimmed Mean** | Top/bottom percentile removal before averaging |
+| **FLTrust** | Server-side trust dataset + cosine similarity scoring (Cao et al.) |
+| **R3-FL (Ours)** | PPO agent with blockchain-backed reputation history |
 
 ### Metrics Tracked
-- Global Model Accuracy
-- Attack Success Rate
-- Convergence Speed (rounds to target accuracy)
-- Reputation Stability (variance of honest vs. malicious scores over time)
-- Blockchain Gas Cost (estimated transaction overhead)
+
+- Global model accuracy per round
+- Attack success rate per round
+- Convergence round (first round exceeding target accuracy)
+- Client aggregation weights per round (final round stored in JSON)
+- Blockchain gas cost (estimated from Hardhat node receipts)
 
 ---
 
-## 🔬 Scientific Impact
+## Performance Notes
 
-This project bridges RL, FL, and Web3 to introduce **learning-based trust models** to decentralized edge computing. Traditional paradigms lack verifiability for node performance, making applications like multi-hospital healthcare learning or automated IoT vehicle swarms risky. Our contribution provides a pathway to self-regulating, tamper-proof network orchestration.
+The codebase includes several performance optimizations relevant to running many simulated clients concurrently:
+
+**CUDA / GPU:**
+- `FlowerClient` uses `torch.amp.GradScaler` for mixed-precision training on CUDA.
+- `PrefetchLoader` overlaps CPU-to-GPU transfers with GPU compute via a dedicated CUDA stream.
+- Optional gradient checkpointing (`use_gradient_checkpointing=True`) trades ~30% extra compute for significantly lower peak activation memory, useful with 50–100 concurrent clients.
+- `RLReputationStrategy` monitors GPU memory utilization and logs a warning at 80% capacity.
+
+**Memory:**
+- `FLReputationEnv` pre-allocates all numpy buffers at construction time; no per-step allocations in the hot path.
+- `RLReputationStrategy._weighted_average()` streams aggregation layer-by-layer and in client chunks of 10, bounding peak VRAM.
+- Benchmark runner explicitly calls `gc.collect()` and `torch.cuda.empty_cache()` between strategy runs.
+
+**Ray / Flower simulation:**
+- Object store capped at 2 GB to prevent Ray from reserving 30% of RAM by default.
+- Per-client GPU fraction is `num_gpus / num_concurrent_clients` to avoid Ray resource exhaustion.
 
 ---
 
-## 📄 License
+## Scientific Context
+
+R3-FL introduces learning-based trust models to federated learning systems that operate over verifiable decentralized infrastructure. Practical applications include:
+
+- Multi-hospital federated learning, where participant trustworthiness cannot be assumed and gradient history must be auditable.
+- IoT device swarms, where individual devices may be compromised and coordinated attacks (Sybil, noise injection) are operationally realistic.
+- Any edge computing scenario where immutable, tamper-proof reputation history provides accountability guarantees that static aggregation rules cannot.
+
+The key contribution is replacing a hand-tuned mathematical filter with a reward-shaped RL policy that adapts its weighting strategy based on accumulated behavioral evidence — including cross-round memory encoded in on-chain reputation scores.
+
+---
+
+## License
 
 This project is for academic and research purposes.

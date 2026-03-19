@@ -30,16 +30,20 @@ STRATEGY_DISPLAY_NAMES: dict[str, str] = {
     "krum": "Krum",
     "trimmed_mean": "Trimmed Mean",
     "fltrust": "FLTrust",
+    "median": "Median",
+    "rl_reputation": "RL Reputation",
     "r3fl": "R3-FL (Ours)",
 }
 
 # Colorblind-friendly palette (tab10 subset; R3-FL gets the most salient colour).
 STRATEGY_COLORS: dict[str, str] = {
-    "r3fl": "#1f77b4",       # blue  — prominent
-    "fedavg": "#ff7f0e",     # orange
-    "krum": "#2ca02c",       # green
+    "r3fl": "#1f77b4",          # blue  — prominent
+    "fedavg": "#ff7f0e",        # orange
+    "krum": "#2ca02c",          # green
     "trimmed_mean": "#d62728",  # red
-    "fltrust": "#9467bd",    # purple
+    "fltrust": "#9467bd",       # purple
+    "median": "#8c564b",        # brown
+    "rl_reputation": "#35e3e9", # cyan
 }
 
 STRATEGY_MARKERS: dict[str, str] = {
@@ -48,6 +52,8 @@ STRATEGY_MARKERS: dict[str, str] = {
     "krum": "s",
     "trimmed_mean": "^",
     "fltrust": "D",
+    "median": "v",
+    "rl_reputation": "1",
 }
 
 FONT_TITLE, FONT_LABEL, FONT_TICK, FONT_LEGEND = 14, 12, 10, 10
@@ -64,13 +70,26 @@ def _display_name(strategy: str) -> str:
 def _style_kwargs(strategy: str) -> dict[str, Any]:
     """Return matplotlib keyword arguments that visually distinguish R3-FL."""
     is_ours = strategy == "r3fl"
-    return {
+    # Line-based markers ("1" tri_down, "x", etc.) need a bigger size and thicker
+    # strokes so their shape is distinguishable from the plot line itself.
+    _LINE_MARKERS = {"1", "2", "3", "4", "+", "x", "|", "_"}
+    marker = STRATEGY_MARKERS.get(strategy, "o")
+    if is_ours:
+        markersize = MARKERSIZE_OURS
+    elif marker in _LINE_MARKERS:
+        markersize = MARKERSIZE_DEFAULT + 7  # 12 — tri_down prongs clearly visible
+    else:
+        markersize = MARKERSIZE_DEFAULT
+    kwargs: dict[str, Any] = {
         "color": STRATEGY_COLORS.get(strategy, "#7f7f7f"),
-        "marker": STRATEGY_MARKERS.get(strategy, "o"),
+        "marker": marker,
         "linewidth": LINEWIDTH_OURS if is_ours else LINEWIDTH_DEFAULT,
-        "markersize": MARKERSIZE_OURS if is_ours else MARKERSIZE_DEFAULT,
+        "markersize": markersize,
         "zorder": 10 if is_ours else 2,
     }
+    if marker in _LINE_MARKERS:
+        kwargs["markeredgewidth"] = 2.5  # thicker strokes for line-based markers
+    return kwargs
 
 
 def _apply_common_style(ax: matplotlib.axes.Axes) -> None:

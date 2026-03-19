@@ -45,8 +45,8 @@ AVAILABLE_STRATEGIES = [
     "fedavg", "krum", "median", "trimmed_mean", "fltrust", "rl_reputation",
 ]
 DEFAULTS = dict(
-    num_rounds=5, num_clients=100, malicious_fraction=0.3,
-    fraction_fit=0.1, target_accuracy=0.7, seed=42,
+    num_rounds=5, num_clients=20, malicious_fraction=0.3,
+    fraction_fit=0.2, target_accuracy=0.7, seed=42,
     trimmed_beta=0.1, batch_size=32, dirichlet_alpha=0.5,
 )
 
@@ -61,8 +61,8 @@ def _benchmark_client_resources(num_concurrent_clients: int = 10) -> Dict[str, f
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         gpu_fraction = num_gpus / max(num_concurrent_clients, 1)
-        return {"num_cpus": 1, "num_gpus": gpu_fraction}
-    return {"num_cpus": 1, "num_gpus": 0.0}
+        return {"num_cpus": 2, "num_gpus": gpu_fraction}
+    return {"num_cpus": 2, "num_gpus": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +75,9 @@ def make_evaluate_fn(test_dataset, device):
 
     def evaluate_fn(server_round, parameters, config):
         model = FemnistCNN().to(device)
-        ndarrays = parameters_to_ndarrays(parameters)
+        # parameters is already a list of ndarrays (FedAvg converts before calling,
+        # and _BaseRobustStrategy.evaluate() now does the same).
+        ndarrays = parameters
         keys = list(model.state_dict().keys())
         model.load_state_dict(
             OrderedDict({k: torch.tensor(v) for k, v in zip(keys, ndarrays)}),
@@ -141,7 +143,10 @@ class _BaseRobustStrategy(fl.server.strategy.Strategy):
 
     def evaluate(self, server_round, parameters):
         if self._evaluate_fn:
-            return self._evaluate_fn(server_round, parameters, {})
+            # Convert to ndarray list first so evaluate_fn always receives a list,
+            # matching the convention used by Flower's built-in FedAvg.evaluate().
+            ndarrays = parameters_to_ndarrays(parameters)
+            return self._evaluate_fn(server_round, ndarrays, {})
         return None
 
     def aggregate_evaluate(self, server_round, results, failures):
@@ -377,8 +382,8 @@ def _create_rl_strategy(num_clients, evaluate_fn, initial_params, frac, min_fit)
         from src.integration.strategy import RLReputationStrategy
     except ImportError as exc:
         raise RuntimeError("RLReputationStrategy deps missing.") from exc
-    candidates = ["checkpoints/ppo_latest", "checkpoints/ppo",
-                   os.environ.get("PPO_CHECKPOINT_PATH", "")]
+    candidates = ["checkpoints/fl_reputation_ppo", "checkpoints/ppo_latest",
+                   "checkpoints/ppo", os.environ.get("PPO_CHECKPOINT_PATH", "")]
     path = next((c for c in candidates if c and os.path.exists(c)), None)
     if path is None:
         raise RuntimeError("No PPO checkpoint found. Set PPO_CHECKPOINT_PATH.")
@@ -387,6 +392,7 @@ def _create_rl_strategy(num_clients, evaluate_fn, initial_params, frac, min_fit)
         fraction_fit=frac, fraction_evaluate=0.05, min_fit_clients=min_fit,
         min_evaluate_clients=5, min_available_clients=num_clients,
         initial_parameters=initial_params,
+        evaluate_fn=evaluate_fn,
     )
 
 
@@ -474,22 +480,50 @@ def run_single_benchmark(strategy_name, num_clients, num_rounds,
             client_fn=client_fn, num_clients=num_clients,
             config=fl.server.ServerConfig(num_rounds=num_rounds),
             strategy=strategy, client_resources=client_res,
+            ray_init_args={
+                "num_cpus": os.cpu_count() or 4,
+                # Cap Ray object store at 2 GB to prevent it from claiming
+                # 30% of available RAM (the default), which pushes total usage
+                # over the 95% threshold that triggers Ray OOM kills.
+                "object_store_memory": int(2 * 1024**3),
+            },
         )
     except Exception:
         logger.exception(
             "start_simulation crashed for strategy '%s'; returning empty results.",
             strategy_name,
         )
+        # Release large objects even on failure before returning
+        del train_ds, test_ds, part_idx, client_fn
+        gc.collect()
         return {}
 
     results = _collect_results(history, strategy_name, attack_type,
                                malicious_fraction, num_clients, num_rounds,
                                target_accuracy, strategy)
+
+    # Save results immediately — before any cleanup that might crash.
+    # ppo_algo.stop() below can trigger a SIGABRT if the Ray cluster was
+    # already torn down by start_simulation, so we must persist results first.
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{strategy_name}_metrics.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     logger.info("Results saved to %s", out_path)
+
+    # Attempt a clean PPO shutdown.  Flower's start_simulation calls
+    # ray.shutdown() internally, which kills all Ray workers.  If ppo_algo
+    # still holds references to those dead workers, stop() can raise or even
+    # SIGABRT via the Ray C++ layer.  We simply null the reference here so
+    # that GC destroys it silently without calling stop() on dead actors.
+    if hasattr(strategy, "ppo_algo") and strategy.ppo_algo is not None:
+        strategy.ppo_algo = None
+        logger.debug("PPO algorithm reference cleared (Ray already shut down by simulation).")
+
+    # Release large in-memory objects so the GC can reclaim RAM before the
+    # next strategy run starts.
+    del train_ds, test_ds, part_idx, client_fn, strategy
+    gc.collect()
     return results
 
 

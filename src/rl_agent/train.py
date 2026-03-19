@@ -6,7 +6,8 @@ honest clients and downweight malicious ones.
 
 Performance features:
     - Multi-GPU: num_gpus = torch.cuda.device_count() (graceful CPU fallback)
-    - Worker scaling: num_rollout_workers = max(4, os.cpu_count() - 2)
+    - Worker scaling: num_env_runners = min(max(1, os.cpu_count() - 2), 8)
+    - Workers collect rollouts on CPU only; full GPU is reserved for the learner
     - Mixed-precision hints via torch.set_default_dtype(torch.float32)
     - CUDA timing around policy inference (exposed via --time-inference flag)
     - Triton reward normalization kernel imported with graceful fallback
@@ -108,9 +109,12 @@ def _detect_gpu_resources() -> tuple[int, float]:
         [torch.cuda.get_device_name(i) for i in range(n_gpus)],
     )
 
-    # Give all GPUs to the learner; workers share GPU capacity at 0.5 each.
-    # 0.5 GPU per worker allows 2 workers per physical GPU for rollout inference.
-    return n_gpus, 0.5
+    # Give all GPUs to the learner; workers run rollouts on CPU only.
+    # Allocating GPU fractions to workers on a single-GPU machine causes Ray to
+    # demand more GPUs than exist (e.g. 30 workers × 0.5 = 15 GPUs required).
+    # Workers do not need GPU for environment stepping; keeping them CPU-only
+    # leaves the full GPU budget for the learner's policy-update step.
+    return n_gpus, 0.0
 
 
 def build_ppo_config(
@@ -136,7 +140,9 @@ def build_ppo_config(
     # ------------------------------------------------------------------ #
     if num_workers is None:
         cpu_count = os.cpu_count() or 4
-        num_workers = max(4, cpu_count - 2)
+        # Leave 2 cores for the driver/learner; cap at 8 for laptop-class machines
+        # to avoid spawning more Ray workers than the OS can schedule efficiently.
+        num_workers = min(max(1, cpu_count - 2), 8)
     logger.info("Configuring %d rollout workers.", num_workers)
 
     # ------------------------------------------------------------------ #
@@ -156,16 +162,17 @@ def build_ppo_config(
         .resources(
             # num_gpus allocates GPUs to the learner (policy update) process
             num_gpus=num_gpus_learner,
-            # num_gpus_per_worker allocates fractional GPUs to rollout workers
-            # for batch inference during environment interaction
-            num_gpus_per_worker=num_gpus_per_worker,
         )
         .env_runners(
             # Scale workers to CPU count for maximum rollout throughput
             num_env_runners=num_workers,
-            # rollout_fragment_length: steps collected per worker per iteration.
-            # 200 steps/worker * N workers fills train_batch_size=4000 in ceil(4000/(200*N)) iters
-            rollout_fragment_length=200,
+            # rollout_fragment_length="auto" lets RLlib derive the per-worker
+            # fragment length from train_batch_size and num_env_runners, avoiding
+            # the ValueError when the manual value doesn't divide evenly.
+            rollout_fragment_length="auto",
+            # num_gpus_per_env_runner replaces the deprecated num_gpus_per_worker
+            # parameter (previously passed via .resources()) for rollout workers.
+            num_gpus_per_env_runner=num_gpus_per_worker,
         )
         .training(
             # train_batch_size=4000 requires ~2-3 GB VRAM on GPU; reduce if OOM

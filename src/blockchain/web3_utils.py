@@ -175,6 +175,18 @@ def get_contract(address: Optional[str] = None) -> Contract:
     if address is None:
         address = _contract_address or os.environ.get("CONTRACT_ADDRESS")
 
+    if address is None:
+        _deployment_json = _PROJECT_ROOT / "deployment.json"
+        if _deployment_json.exists():
+            with _deployment_json.open() as _fh:
+                _deployment_data = json.load(_fh)
+            if "address" not in _deployment_data:
+                raise KeyError(
+                    f"deployment.json found at {_deployment_json} but does not "
+                    "contain the expected 'address' key."
+                )
+            address = _deployment_data["address"]
+
     if address and _contract_instance and _contract_instance.address == Web3.to_checksum_address(address):
         return _contract_instance
 
