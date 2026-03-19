@@ -113,6 +113,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         initial_parameters: Optional[Parameters] = None,
         client_addresses: Optional[Dict[str, str]] = None,
         reputation_scale: int = _REPUTATION_SCALE_DEFAULT,
+        evaluate_fn: Optional[Any] = None,
     ) -> None:
         super().__init__()
 
@@ -125,6 +126,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         self.min_available_clients = min_available_clients
         self.initial_parameters = initial_parameters
         self.reputation_scale = reputation_scale
+        self._evaluate_fn = evaluate_fn
 
         # Client address mapping (Flower CID -> Ethereum address)
         self.client_address_map: Dict[str, str] = client_addresses or {}
@@ -135,13 +137,34 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         # Load PPO algorithm --------------------------------------------------
         self.ppo_algo: Optional[Any] = None
         try:
+            import os as _os
+            # Prevent TensorboardX from registering an atexit handler that
+            # tries to create threads after the interpreter begins shutdown.
+            # Ray shuts down (via Flower simulation) before our atexit hooks
+            # run, so the background TBX writer thread cannot be joined cleanly
+            # — this env var disables auto-callback loggers (including TBX).
+            _os.environ.setdefault("TUNE_DISABLE_AUTO_CALLBACK_LOGGERS", "1")
+
             from ray.rllib.algorithms.algorithm import Algorithm
             from ray.tune.registry import register_env
             from src.rl_agent.env import FLReputationEnv
             from src.rl_agent.train import ENV_NAME, env_creator
 
             register_env(ENV_NAME, env_creator)
+
+            # Clean up any stale Ray state (e.g. dead Raylet socket from a
+            # prior Flower simulation) before loading the PPO checkpoint,
+            # which internally calls ray.init().
+            import ray
+            if ray.is_initialized():
+                ray.shutdown()
+            ray.init(ignore_reinit_error=True)
+
             self.ppo_algo = Algorithm.from_checkpoint(ppo_checkpoint_path)
+            # Close RLlib's internal loggers (including TBX) since we only
+            # use the algorithm for inference, not training/logging.
+            if hasattr(self.ppo_algo, '_result_logger') and self.ppo_algo._result_logger:
+                self.ppo_algo._result_logger.close()
             logger.info(
                 "PPO algorithm loaded from checkpoint: %s",
                 ppo_checkpoint_path,
@@ -244,8 +267,42 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         server_round: int,
         parameters: Parameters,
     ) -> Optional[Tuple[float, Dict[str, Scalar]]]:
-        """Server-side evaluation (not used -- evaluation is distributed)."""
-        return None
+        """Server-side centralized evaluation using the provided evaluate_fn.
+
+        When an ``evaluate_fn`` is supplied (e.g. from the benchmark harness),
+        it is called here so that Flower records centralized accuracy into
+        ``history.metrics_centralized``.  Without this, accuracy would only
+        appear in ``history.metrics_distributed`` (from client evaluate rounds),
+        which the benchmark's ``_collect_results`` does not currently read,
+        causing ``final_acc=0.0`` in the summary.
+
+        If no ``evaluate_fn`` was provided the method returns ``None`` and
+        Flower falls back to distributed client evaluation only.
+        """
+        logger.info(
+            "evaluate() called round=%d, has_fn=%s",
+            server_round,
+            self._evaluate_fn is not None,
+        )
+        if self._evaluate_fn is None:
+            return None
+        ndarrays = parameters_to_ndarrays(parameters)
+        try:
+            result = self._evaluate_fn(server_round, ndarrays, {})
+            logger.info(
+                "evaluate() round=%d returned loss=%.6f metrics=%s",
+                server_round,
+                result[0] if result else float("nan"),
+                result[1] if result else {},
+            )
+            return result
+        except Exception:
+            logger.error(
+                "evaluate() round=%d: evaluate_fn raised an exception",
+                server_round,
+                exc_info=True,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # aggregate_evaluate
@@ -587,8 +644,22 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
 
         Falls back to uniform weights if PPO is unavailable or inference fails.
 
+        The PPO model was trained with a fixed observation space of shape
+        (NUM_CLIENTS, NUM_FEATURES) = (100, 5).  When the live benchmark runs
+        with fewer clients (e.g. --num-clients 20), ``state`` has shape
+        (num_clients, NUM_FEATURES) which flattens to fewer elements than the
+        policy network expects.  We pad the state to (NUM_CLIENTS, NUM_FEATURES)
+        with the neutral feature value (0.5) before inference so the shape
+        always matches the trained model.  Participating indices are already
+        relative to the padded matrix, so post-inference weight extraction is
+        unchanged.
+
+        Note: if you retrain the PPO model, train with NUM_CLIENTS=100 clients
+        (the value in src/rl_agent/env.py) to keep inference compatible with
+        any benchmark --num-clients value up to 100.
+
         Args:
-            state: Observation matrix of shape (NUM_CLIENTS, NUM_FEATURES).
+            state: Observation matrix of shape (self.num_clients, NUM_FEATURES).
             participating_indices: Indices of actual participants in the state.
 
         Returns:
@@ -598,7 +669,27 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
 
         if self.ppo_algo is not None:
             try:
-                action = self.ppo_algo.compute_single_action(state)
+                # Pad state to the fixed obs shape the PPO model was trained on.
+                # If self.num_clients already equals NUM_CLIENTS, this is a no-op
+                # (np.copyto into a same-shape array).  If it is smaller, the
+                # extra rows are left at the neutral value (0.5) — non-
+                # participating clients that the model has never seen still get
+                # a sensible default feature vector so the policy network's
+                # linear layer receives a valid input of the expected size.
+                if state.shape[0] != NUM_CLIENTS:
+                    padded_state = np.full(
+                        (NUM_CLIENTS, NUM_FEATURES),
+                        _NEUTRAL_FEATURE,
+                        dtype=np.float32,
+                    )
+                    # Copy only the rows that actually exist in ``state``.
+                    rows_to_copy = min(state.shape[0], NUM_CLIENTS)
+                    padded_state[:rows_to_copy] = state[:rows_to_copy]
+                    inference_state = padded_state
+                else:
+                    inference_state = state
+
+                action = self.ppo_algo.compute_single_action(inference_state)
                 # action shape: (NUM_CLIENTS,)
                 action = np.asarray(action, dtype=np.float32)
 

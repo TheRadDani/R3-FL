@@ -66,7 +66,7 @@ def _style_kwargs(strategy: str) -> dict[str, Any]:
     is_ours = strategy == "r3fl"
     return {
         "color": STRATEGY_COLORS.get(strategy, "#7f7f7f"),
-        "marker": STRATEGY_MARKERS.get(strategy, "o"),
+        "marker": STRATEGY_MARKERS.get(strategy, "x"),
         "linewidth": LINEWIDTH_OURS if is_ours else LINEWIDTH_DEFAULT,
         "markersize": MARKERSIZE_OURS if is_ours else MARKERSIZE_DEFAULT,
         "zorder": 10 if is_ours else 2,
