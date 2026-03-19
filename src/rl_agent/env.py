@@ -1,17 +1,21 @@
-"""Custom Gymnasium environment for RL-based Federated Learning reputation management.
+"""Multi-Agent Gymnasium environment for RL-based Federated Learning reputation management.
 
-This environment simulates a Federated Learning system where an RL agent (PPO)
-learns to assign aggregation weights to clients based on behavioral features.
-The agent must learn to upweight honest clients and downweight malicious ones
-to maintain global model accuracy while mitigating poisoning attacks.
+Location: src/rl_agent/env.py
+Summary: Defines FLReputationEnv, a MultiAgentEnv (Ray RLlib) where each FL client
+is modeled as an independent MAPPO agent with parameter sharing. Each agent observes
+its own 5-feature vector and outputs a single scalar aggregation weight. The global
+reward is shared cooperatively across all agents.
 
-Environment Spaces:
-    Observation: Box(0, 1, shape=(NUM_CLIENTS, NUM_FEATURES)) — per-client feature matrix
-    Action: Box(0, 1, shape=(NUM_CLIENTS,)) — aggregation weight per client
+Used by: src/rl_agent/train.py (training loop), src/rl_agent/config.py (RLlib config).
+
+Architecture: MAPPO with parameter sharing
+    - NUM_CLIENTS agents, each identified as "agent_0" .. "agent_{N-1}"
+    - Observation per agent: Box(0, 1, shape=(NUM_FEATURES,)) — local feature vector
+    - Action per agent: Box(0, 1, shape=(1,)) — scalar aggregation weight
+    - Reward: cooperative (identical global reward broadcast to every agent)
 
 Performance notes:
     - _state is a pre-allocated float32 buffer reused every step (no GC pressure)
-    - _obs_buffer is a pre-allocated flat copy buffer returned from step()/reset()
     - Reward computation is fully vectorized with no Python loops
     - Static coefficients (log_num_clients, etc.) pre-computed at init time
     - Reputation update avoids temporary arrays via in-place numpy ops
@@ -24,6 +28,7 @@ from typing import Any, Optional
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +73,14 @@ _REPUTATION_EMA_ALPHA: float = 0.3
 _REPUTATION_EMA_BETA: float = 1.0 - _REPUTATION_EMA_ALPHA
 
 
-class FLReputationEnv(gym.Env):
-    """Gymnasium environment simulating an FL aggregation round.
+class FLReputationEnv(MultiAgentEnv):
+    """Multi-agent environment simulating an FL aggregation round (MAPPO).
 
-    The RL agent observes per-client behavioral metrics and outputs aggregation
-    weights.  The reward encourages high weighted accuracy while penalising
-    weight allocated to malicious clients.
+    Each of the NUM_CLIENTS FL clients is modeled as an independent RL agent.
+    All agents share the same policy network (parameter sharing). Each agent
+    observes its own 5-feature behavioral vector and outputs a single scalar
+    aggregation weight. The reward is cooperative: every agent receives the
+    same global reward signal.
 
     Reward:
         R = alpha * weighted_accuracy - beta * attack_impact
@@ -110,18 +117,22 @@ class FLReputationEnv(gym.Env):
         self.max_rounds = max_rounds
         self.render_mode = render_mode
 
-        # Gymnasium spaces — explicit float32 dtype avoids RLlib's silent
-        # float64→float32 downcast which burns a memcpy every step
+        # Agent IDs — required by MultiAgentEnv
+        self._agent_ids = {f"agent_{i}" for i in range(NUM_CLIENTS)}
+
+        # Per-agent spaces — each agent sees its own feature vector and
+        # outputs a single scalar weight. Explicit float32 dtype avoids
+        # RLlib's silent float64→float32 downcast which burns a memcpy.
         self.observation_space = spaces.Box(
             low=np.float32(0.0),
             high=np.float32(1.0),
-            shape=(NUM_CLIENTS, NUM_FEATURES),
+            shape=(NUM_FEATURES,),
             dtype=np.float32,
         )
         self.action_space = spaces.Box(
             low=np.float32(0.0),
             high=np.float32(1.0),
-            shape=(NUM_CLIENTS,),
+            shape=(1,),
             dtype=np.float32,
         )
 
@@ -132,12 +143,6 @@ class FLReputationEnv(gym.Env):
 
         # Main state matrix — written in-place by _generate_state()
         self._state: np.ndarray = np.zeros(
-            (NUM_CLIENTS, NUM_FEATURES), dtype=np.float32
-        )
-
-        # Observation output buffer — step()/reset() copy into this and return
-        # a view; RLlib makes its own copy so we can safely return the same buffer
-        self._obs_buffer: np.ndarray = np.zeros(
             (NUM_CLIENTS, NUM_FEATURES), dtype=np.float32
         )
 
@@ -181,7 +186,7 @@ class FLReputationEnv(gym.Env):
         self._wsum_eps: np.float32 = np.float32(1e-8)
 
     # --------------------------------------------------------------------- #
-    # Gymnasium API
+    # MultiAgentEnv API
     # --------------------------------------------------------------------- #
 
     def reset(
@@ -189,7 +194,7 @@ class FLReputationEnv(gym.Env):
         *,
         seed: Optional[int] = None,
         options: Optional[dict[str, Any]] = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
         """Reset the environment to an initial state.
 
         Args:
@@ -197,11 +202,10 @@ class FLReputationEnv(gym.Env):
             options: Currently unused; reserved for future configuration.
 
         Returns:
-            A tuple of (initial_observation, info_dict).
+            A tuple of (obs_dict, info_dict) where each maps agent IDs to
+            per-agent observations and info dicts respectively.
         """
-        super().reset(seed=seed)
-
-        # Create a fresh RNG from the Gymnasium-managed seed
+        # Manage RNG directly (MultiAgentEnv doesn't use gymnasium's seed protocol)
         self._rng = np.random.default_rng(seed)
 
         # Randomly designate malicious clients for this episode
@@ -224,29 +228,45 @@ class FLReputationEnv(gym.Env):
         # Generate the first observation (writes into self._state in-place)
         self._generate_state(initial=True)
 
-        # Copy state into the obs buffer and return — RLlib copies again internally
-        np.copyto(self._obs_buffer, self._state)
-
-        info: dict[str, Any] = {
-            "round": self._round,
-            "num_malicious": int(num_malicious),
+        # Build per-agent observation and info dicts
+        obs_dict = {
+            f"agent_{i}": self._state[i].copy() for i in range(NUM_CLIENTS)
         }
-        return self._obs_buffer.copy(), info
+        info_dict = {
+            f"agent_{i}": {"round": 0, "num_malicious": num_malicious}
+            for i in range(NUM_CLIENTS)
+        }
+        return obs_dict, info_dict
 
     def step(
-        self, action: np.ndarray
-    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        self, action_dict: dict[str, np.ndarray]
+    ) -> tuple[
+        dict[str, np.ndarray],
+        dict[str, float],
+        dict[str, bool],
+        dict[str, bool],
+        dict[str, dict[str, Any]],
+    ]:
         """Execute one FL aggregation round.
 
         Args:
-            action: Array of shape (NUM_CLIENTS,) with per-client weights in [0, 1].
+            action_dict: Mapping of agent IDs to shape-(1,) arrays with per-agent
+                         aggregation weights in [0, 1].
 
         Returns:
-            A 5-tuple (observation, reward, terminated, truncated, info).
+            A 5-tuple (obs_dict, rewards_dict, terminateds, truncateds, infos)
+            where each is keyed by agent ID. terminateds and truncateds also
+            include an "__all__" key.
         """
-        # Clip action to valid range in-place where possible.
-        # astype with copy=False avoids a copy when action is already float32.
-        weights = np.clip(action, 0.0, 1.0).astype(np.float32, copy=False)
+        # Parse per-agent actions into a single weight vector
+        weights = np.array(
+            [float(action_dict[f"agent_{i}"][0]) for i in range(NUM_CLIENTS)],
+            dtype=np.float32,
+        )
+
+        # Clip action to valid range — astype with copy=False avoids a copy
+        # when weights is already float32
+        weights = np.clip(weights, 0.0, 1.0).astype(np.float32, copy=False)
 
         # Compute reward for this round (fully vectorized, no Python loops)
         reward, reward_info = self._compute_reward(weights)
@@ -264,21 +284,40 @@ class FLReputationEnv(gym.Env):
         self._generate_state(initial=False)
 
         terminated = self._round >= self.max_rounds
-        truncated = False
 
-        # Copy state into obs buffer
-        np.copyto(self._obs_buffer, self._state)
+        # Build per-agent return dicts
+        obs_dict = {
+            f"agent_{i}": self._state[i].copy() for i in range(NUM_CLIENTS)
+        }
 
-        info: dict[str, Any] = {
-            "round": self._round,
-            "cumulative_reward": self._cumulative_reward,
-            **reward_info,
+        # Cooperative reward: every agent receives the same global reward
+        rewards_dict = {
+            f"agent_{i}": reward for i in range(NUM_CLIENTS)
+        }
+
+        terminateds: dict[str, bool] = {
+            f"agent_{i}": terminated for i in range(NUM_CLIENTS)
+        }
+        terminateds["__all__"] = terminated
+
+        truncateds: dict[str, bool] = {
+            f"agent_{i}": False for i in range(NUM_CLIENTS)
+        }
+        truncateds["__all__"] = False
+
+        infos = {
+            f"agent_{i}": {
+                "round": self._round,
+                "cumulative_reward": self._cumulative_reward,
+                **reward_info,
+            }
+            for i in range(NUM_CLIENTS)
         }
 
         if self.render_mode == "human":
             self.render()
 
-        return self._obs_buffer.copy(), reward, terminated, truncated, info
+        return obs_dict, rewards_dict, terminateds, truncateds, infos
 
     def render(self) -> None:
         """Print a human-readable summary of the current round."""

@@ -7,7 +7,7 @@ ledger, and a trained RLlib PPO agent for intelligent aggregation weighting.
 The ``RLReputationStrategy`` overrides ``aggregate_fit`` to:
 1. Extract per-client model updates from Flower ``FitRes`` results.
 2. Fetch on-chain reputation history via ``web3_utils``.
-3. Build a (NUM_CLIENTS x NUM_FEATURES) state matrix for the PPO agent.
+3. Build a (K x NUM_FEATURES) state matrix for participating clients.
 4. Run PPO inference to obtain per-client aggregation weights.
 5. Perform weighted aggregation of model parameters.
 6. Update on-chain reputation scores and persist the aggregated model.
@@ -373,7 +373,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             1. Convert each client's FitRes parameters to torch tensors.
             2. Fetch on-chain reputation for each participating client.
             3. Compute per-client features (similarity, magnitude, etc.).
-            4. Build a (num_clients x 5) state matrix for the PPO agent.
+            4. Build a (K x 5) state matrix for participating clients.
             5. Run PPO inference to get aggregation weights.
             6. Perform weighted average of model parameters.
             7. Update on-chain reputation scores.
@@ -592,19 +592,22 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
 
     def _build_state_matrix(
         self,
-        participating_indices: List[int],
+        participating_indices: List[int],  # kept for API compat but unused internally now
         accuracies: np.ndarray,
         similarities: np.ndarray,
         reputations: np.ndarray,
         loss_improvements: np.ndarray,
         magnitudes: np.ndarray,
     ) -> np.ndarray:
-        """Build the full (NUM_CLIENTS x NUM_FEATURES) observation matrix.
+        """Build a compact (K, NUM_FEATURES) observation matrix for K participating clients.
 
-        Non-participating client rows are filled with the neutral value (0.5).
+        With parameter-shared MAPPO, the shared policy processes each client
+        row independently — there is no need to pad to the full NUM_CLIENTS
+        dimension.  The matrix contains only rows for clients that actually
+        participated in this round.
 
         Args:
-            participating_indices: Indices assigned to actual participants.
+            participating_indices: Kept for API compatibility; unused internally.
             accuracies: Per-participant accuracy contribution.
             similarities: Per-participant gradient similarity.
             reputations: Per-participant normalised reputation.
@@ -612,23 +615,15 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             magnitudes: Per-participant update magnitude.
 
         Returns:
-            State matrix of shape (NUM_CLIENTS, NUM_FEATURES).
+            State matrix of shape (K, NUM_FEATURES) where K = len(accuracies).
         """
-        state = np.full(
-            (self.num_clients, NUM_FEATURES),
-            _NEUTRAL_FEATURE,
-            dtype=np.float32,
-        )
-
-        for local_idx, global_idx in enumerate(participating_indices):
-            if global_idx >= self.num_clients:
-                continue
-            state[global_idx, 0] = accuracies[local_idx]
-            state[global_idx, 1] = similarities[local_idx]
-            state[global_idx, 2] = reputations[local_idx]
-            state[global_idx, 3] = loss_improvements[local_idx]
-            state[global_idx, 4] = magnitudes[local_idx]
-
+        K = len(accuracies)
+        state = np.zeros((K, NUM_FEATURES), dtype=np.float32)
+        state[:, 0] = accuracies
+        state[:, 1] = similarities
+        state[:, 2] = reputations
+        state[:, 3] = loss_improvements
+        state[:, 4] = magnitudes
         return np.clip(state, 0.0, 1.0)
 
     # ------------------------------------------------------------------
@@ -637,68 +632,40 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
 
     def _ppo_inference(
         self,
-        state: np.ndarray,
-        participating_indices: List[int],
+        state: np.ndarray,       # now (K, NUM_FEATURES) — K participating clients only
+        participating_indices: List[int],  # kept for API compat
     ) -> np.ndarray:
-        """Run PPO to obtain per-participant aggregation weights.
+        """Run MAPPO shared policy to obtain per-participant aggregation weights.
 
         Falls back to uniform weights if PPO is unavailable or inference fails.
 
-        The PPO model was trained with a fixed observation space of shape
-        (NUM_CLIENTS, NUM_FEATURES) = (100, 5).  When the live benchmark runs
-        with fewer clients (e.g. --num-clients 20), ``state`` has shape
-        (num_clients, NUM_FEATURES) which flattens to fewer elements than the
-        policy network expects.  We pad the state to (NUM_CLIENTS, NUM_FEATURES)
-        with the neutral feature value (0.5) before inference so the shape
-        always matches the trained model.  Participating indices are already
-        relative to the padded matrix, so post-inference weight extraction is
-        unchanged.
-
-        Note: if you retrain the PPO model, train with NUM_CLIENTS=100 clients
-        (the value in src/rl_agent/env.py) to keep inference compatible with
-        any benchmark --num-clients value up to 100.
+        With parameter-shared MAPPO, a single policy maps each client's
+        per-row feature vector of shape ``(NUM_FEATURES,)`` to a scalar
+        weight.  Each row of the ``(K, NUM_FEATURES)`` state matrix is
+        independently passed through the shared policy via
+        ``compute_single_action`` with ``policy_id="shared_policy"``.
+        No padding to ``NUM_CLIENTS`` is required because the policy
+        operates on individual rows, not the full client matrix.
 
         Args:
-            state: Observation matrix of shape (self.num_clients, NUM_FEATURES).
-            participating_indices: Indices of actual participants in the state.
+            state: Observation matrix of shape (K, NUM_FEATURES) where
+                K is the number of participating clients this round.
+            participating_indices: Kept for API compatibility; unused internally.
 
         Returns:
-            Normalised weight array of shape (num_participating,) summing to 1.
+            Normalised weight array of shape (K,) summing to 1.
         """
-        num_participating = len(participating_indices)
+        K = state.shape[0]
 
         if self.ppo_algo is not None:
             try:
-                # Pad state to the fixed obs shape the PPO model was trained on.
-                # If self.num_clients already equals NUM_CLIENTS, this is a no-op
-                # (np.copyto into a same-shape array).  If it is smaller, the
-                # extra rows are left at the neutral value (0.5) — non-
-                # participating clients that the model has never seen still get
-                # a sensible default feature vector so the policy network's
-                # linear layer receives a valid input of the expected size.
-                if state.shape[0] != NUM_CLIENTS:
-                    padded_state = np.full(
-                        (NUM_CLIENTS, NUM_FEATURES),
-                        _NEUTRAL_FEATURE,
-                        dtype=np.float32,
+                raw_weights = np.zeros(K, dtype=np.float32)
+                for i in range(K):
+                    obs_i = state[i]  # shape (NUM_FEATURES,) = (5,)
+                    action = self.ppo_algo.compute_single_action(
+                        obs_i, policy_id="shared_policy"
                     )
-                    # Copy only the rows that actually exist in ``state``.
-                    rows_to_copy = min(state.shape[0], NUM_CLIENTS)
-                    padded_state[:rows_to_copy] = state[:rows_to_copy]
-                    inference_state = padded_state
-                else:
-                    inference_state = state
-
-                action = self.ppo_algo.compute_single_action(inference_state)
-                # action shape: (NUM_CLIENTS,)
-                action = np.asarray(action, dtype=np.float32)
-
-                # Extract weights for participating clients only
-                raw_weights = np.array(
-                    [action[idx] for idx in participating_indices],
-                    dtype=np.float32,
-                )
-                raw_weights = np.clip(raw_weights, 0.0, 1.0)
+                    raw_weights[i] = float(np.clip(action[0], 0.0, 1.0))
 
                 # Normalise to sum to 1
                 weight_sum = raw_weights.sum()
@@ -715,9 +682,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
                 )
 
         # Fallback: uniform (FedAvg-style)
-        uniform = np.full(
-            num_participating, 1.0 / num_participating, dtype=np.float32
-        )
+        uniform = np.full(K, 1.0 / K, dtype=np.float32)
         return uniform
 
     # ------------------------------------------------------------------

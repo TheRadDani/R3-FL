@@ -8,19 +8,19 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18+-339933.svg?logo=node.js)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-Research-lightgrey.svg)](#license)
 
-> A research framework that uses a PPO reinforcement learning agent as a dynamic, self-learning trust arbiter inside a federated learning aggregation server, backed by an on-chain Ethereum reputation ledger.
+> A research framework that uses a Multi-Agent PPO (MAPPO) reinforcement learning system with parameter sharing as a dynamic, self-learning trust arbiter inside a federated learning aggregation server, backed by an on-chain Ethereum reputation ledger.
 
 ---
 
 ## Overview
 
-Traditional federated learning defenses against poisoning attacks — Krum, coordinate-wise Median, Trimmed Mean — rely on static mathematical rules. Adversaries learn to evade them. R3-FL replaces static rules with a trained Proximal Policy Optimization (PPO) agent that observes per-client behavioral signals each round and outputs continuous aggregation weights. The agent learns over time which clients are trustworthy, adapting to adversarial strategies that static methods cannot detect.
+Traditional federated learning defenses against poisoning attacks — Krum, coordinate-wise Median, Trimmed Mean — rely on static mathematical rules. Adversaries learn to evade them. R3-FL replaces static rules with a trained Multi-Agent Proximal Policy Optimization (MAPPO) system with parameter sharing that observes per-client behavioral signals each round and outputs continuous aggregation weights. The agent learns over time which clients are trustworthy, adapting to adversarial strategies that static methods cannot detect.
 
 The system consists of three tightly integrated layers:
 
 1. **Federated Learning core** (Flower): A simulation of up to 100 clients training a CNN on FEMNIST. Clients may be honest, label-flipping, or noise-injecting. The server uses one of six pluggable aggregation strategies.
 
-2. **Reinforcement Learning agent** (Ray RLlib / PPO): A custom Gymnasium environment (`FLReputationEnv`) models one FL aggregation round as a single RL step. The agent observes a 100×5 feature matrix per round and outputs a 100-dimensional weight vector. It is trained offline, then loaded as a frozen policy at FL simulation time.
+2. **Reinforcement Learning agent** (Ray RLlib / MAPPO): A custom Ray `MultiAgentEnv` environment (`FLReputationEnv`) models one FL aggregation round as a single RL step. Each FL client maps to one RL agent; all agents share a single policy network. The agent observes a (K×5) feature matrix (where K = number of participating clients) and each agent independently outputs a scalar aggregation weight. The system dynamically adapts to varying client cohort sizes without padding or retraining. It is trained offline, then loaded as a frozen policy at FL simulation time.
 
 3. **Blockchain reputation ledger** (Ethereum / Hardhat): A Solidity smart contract (`ReputationManager`) stores every client's integer reputation score, gradient content-ID hash, and timestamp immutably on-chain. Redis stores the actual serialized model tensors off-chain; only the UUID key is committed on-chain to avoid gas costs for large payloads.
 
@@ -34,7 +34,7 @@ An AI agent running inside the aggregation server can learn to distinguish adver
 
 ### State Vector
 
-At each communication round the RL agent receives an observation matrix of shape `(100, 5)` — one row per client, five features per client:
+At each communication round, each RL agent (one per participating client) receives an individual observation vector of shape `(5,)`:
 
 | Feature index | Name | Description |
 |---|---|---|
@@ -43,6 +43,8 @@ At each communication round the RL agent receives an observation matrix of shape
 | 2 | `historical_reputation` | Exponential moving average (α=0.3) of past reputation, fetched from the blockchain |
 | 3 | `loss_improvement` | Reduction in the global loss attributable to this client's update |
 | 4 | `update_magnitude` | L2 norm of the gradient update, min-max normalized across all clients |
+
+The state matrix is compactly represented as shape `(K, 5)` where K = number of participating clients (no padding). This eliminates the 100-dimensional action space bottleneck and allows the system to dynamically adapt to varying client cohort sizes. All K agents observe their own row and share a single policy network.
 
 ### Reward Function
 
@@ -58,7 +60,7 @@ Where:
 
 ### Aggregation Weights
 
-The PPO action space is `Box(0, 1, shape=(100,))`. The agent outputs a continuous weight per client. Weights for participating clients are extracted, clipped to [0, 1], and L1-normalized to sum to 1 before the weighted parameter average.
+In MAPPO with parameter sharing, each agent independently outputs a continuous scalar weight in [0, 1]. The K participating clients each produce one weight via the shared policy. These K weights are clipped to [0, 1] and L1-normalized to sum to 1 before weighted parameter averaging. This per-agent scalar output eliminates the 100-dimensional centralized action space bottleneck and scales naturally to any client cohort size.
 
 ### Reputation Update (EMA)
 
@@ -91,8 +93,8 @@ flowchart TD
     subgraph Server["FL Server — RLReputationStrategy"]
         FM["1. Receive FitRes\n(model updates)"]
         BC["2. Fetch reputations\nfrom blockchain"]
-        SM["3. Build 100×5\nstate matrix"]
-        RL["4. PPO inference\n→ per-client weights"]
+        SM["3. Build K×5\nstate matrix"]
+        RL["4. MAPPO inference\n(per-client loop)"]
         WA["5. Weighted average\n(chunked, float32)"]
         BU["6. Update blockchain\n+ Redis"]
     end
@@ -116,8 +118,8 @@ flowchart TD
 | `FemnistCNN` | `src/fl_core/dataset.py` | 2-layer CNN, 62-class FEMNIST classifier; shared architecture across all clients and server |
 | `FlowerClient` | `src/fl_core/client.py` | Honest or malicious Flower `NumPyClient`; executes local SGD with optional AMP and gradient checkpointing |
 | `FedAvg server` | `src/fl_core/server.py` | Baseline Flower simulation: 100 clients, 30% malicious (15 label flippers + 15 noise injectors), 10 rounds |
-| `FLReputationEnv` | `src/rl_agent/env.py` | Custom Gymnasium environment; one step = one FL round; reward = accuracy signal minus attack impact |
-| `train.py` | `src/rl_agent/train.py` | Ray RLlib PPO training loop; saves checkpoints to `checkpoints/fl_reputation_ppo/` |
+| `FLReputationEnv` | `src/rl_agent/env.py` | Custom Ray `MultiAgentEnv`; one step = one FL round; per-agent (K,5) observations and scalar actions; dict-based API (obs_dict, action_dict, rewards_dict); all agents share reward |
+| `train.py` | `src/rl_agent/train.py` | Ray RLlib MAPPO training loop with parameter sharing; saves checkpoints to `checkpoints/fl_reputation_ppo/` |
 | `kernels.py` | `src/rl_agent/kernels.py` | Triton JIT kernel for reward normalization; graceful PyTorch fallback |
 | `ReputationManager.sol` | `src/blockchain/contracts/` | Solidity contract: admin-gated write, open read, batch update, `ClientUpdated` events |
 | `storage_utils.py` | `src/blockchain/storage_utils.py` | Redis upload/download for serialized tensors; zlib compression (level 1); UUID as CID key |
@@ -147,8 +149,8 @@ R3-FL/
 │   │   └── server.py           # Baseline FL simulation (FedAvg, 100 clients, 10 rounds)
 │   │
 │   ├── rl_agent/
-│   │   ├── env.py              # FLReputationEnv: Gymnasium env (obs=100×5, act=100-dim weights)
-│   │   ├── train.py            # PPO training loop via Ray RLlib; CLI with --iterations, --num-workers
+│   │   ├── env.py              # FLReputationEnv: Ray MultiAgentEnv (K×5 obs per agent, scalar actions, shared policy)
+│   │   ├── train.py            # MAPPO training loop via Ray RLlib; parameter sharing; CLI with --iterations, --num-workers
 │   │   ├── kernels.py          # Triton reward-normalization kernel + PyTorch fallback + RunningMeanStd
 │   │   └── __init__.py
 │   │
@@ -167,9 +169,11 @@ R3-FL/
 │       └── strategy.py         # RLReputationStrategy: Flower Strategy integrating FL + blockchain + PPO
 │
 ├── tests/
+│   ├── conftest.py             # Shared pytest fixtures and configuration
 │   ├── test_fl_core.py         # Dataset partitioning, CNN forward pass, malicious client behavior
 │   ├── test_blockchain.py      # Redis round-trip, mocked web3 contract calls
-│   └── test_rl_agent.py        # Gymnasium env spaces, reward shape, PPO smoke test
+│   ├── test_rl_agent.py        # MultiAgentEnv spaces, reward shape, MAPPO smoke test
+│   └── test_integration.py     # End-to-end tests for RLReputationStrategy (93 tests)
 │
 ├── docs/                       # Sphinx documentation source (RST + conf.py)
 ├── data/                       # Auto-downloaded EMNIST dataset cache (created on first run)
@@ -180,7 +184,9 @@ R3-FL/
 ├── deployment.json             # Written by deploy.py after contract deployment
 ├── pyproject.toml              # Package metadata (name=r3-fl, requires-python>=3.10)
 ├── requirements.txt            # Python dependencies
-└── .github/workflows/docs.yml  # GitHub Actions: build and deploy Sphinx docs to GitHub Pages
+├── .github/workflows/
+│   ├── docs.yml                # GitHub Actions: build and deploy Sphinx docs to GitHub Pages
+│   └── tests.yml               # GitHub Actions: run pytest suite on push/PR with coverage reporting
 ```
 
 ---
@@ -352,8 +358,11 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Algorithm | PPO | Proximal Policy Optimization |
+| Algorithm | MAPPO | Multi-Agent PPO with parameter sharing |
 | Framework | PyTorch | Explicit; required for AMP |
+| Multi-Agent | Parameter sharing | Single policy network shared across all K agents |
+| Per-agent obs space | (5,) | 5 features: accuracy, similarity, reputation, loss, magnitude |
+| Per-agent action space | (1,) | Scalar weight in [0, 1] |
 | Train batch size | 4000 steps | Reduce if GPU OOM |
 | SGD minibatch | 256 | Balances gradient noise and throughput |
 | SGD iterations | 10 per batch | |
@@ -361,8 +370,8 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 | Discount (γ) | 0.99 | |
 | GAE (λ) | 0.95 | |
 | Clip parameter | 0.2 | PPO clip |
-| Network | [256, 256] FC | Shared trunk for policy and value heads |
-| Rollout fragment | 200 steps/worker | |
+| Network | [64, 64] FC | Sized for 5-feature per-agent inputs (not 100-dim centralized) |
+| Rollout fragment | auto | Derived from train batch and num_env_runners |
 | Evaluation interval | every 10 iterations | 5 episodes |
 
 The script auto-detects GPU resources. On CUDA machines, all GPUs are allocated to the learner; rollout workers run on CPU only (`num_gpus_per_env_runner=0`) to avoid Ray demanding more GPU budget than a single-GPU machine can supply.
@@ -404,13 +413,13 @@ The `RLReputationStrategy` performs these steps each round:
 2. Maps each Flower CID to a deterministic Ethereum address.
 3. Calls `getClient()` on `ReputationManager` to fetch historical reputation scores.
 4. Computes cosine gradient similarity and L2 magnitude for each client.
-5. Assembles the 100×5 state matrix (non-participating slots filled with 0.5).
-6. Calls `ppo_algo.compute_single_action(state)` to get a 100-dim weight vector.
+5. Assembles the compact (K×5) state matrix where K = number of participating clients.
+6. Performs per-client MAPPO inference: loops over K clients, calls `ppo_algo.compute_single_action(obs_i, policy_id="shared_policy")` for each agent, collects scalar weights.
 7. Performs weighted average of model parameters (chunked, 10 clients per chunk, float32 accumulation).
 8. Uploads the aggregated model to Redis; records the UUID key.
 9. Calls `batchUpdateClients()` on the contract to commit all reputation scores atomically.
 
-If the PPO checkpoint is unavailable or inference fails, the strategy falls back to uniform (FedAvg-style) weights and logs a warning.
+If the MAPPO checkpoint is unavailable or inference fails, the strategy falls back to uniform (FedAvg-style) weights and logs a warning. The per-client inference loop naturally adapts to any cohort size without padding or retraining.
 
 ---
 
@@ -564,12 +573,19 @@ pytest tests/ -v
 pytest tests/test_fl_core.py -v
 pytest tests/test_blockchain.py -v
 pytest tests/test_rl_agent.py -v
+pytest tests/test_integration.py -v
+
+# Run tests with coverage report
+pytest tests/ -v --cov=src --cov-report=html
 ```
 
 Tests cover:
 - `test_fl_core.py`: EMNIST loading, Dirichlet partitioning statistics, CNN forward pass, `LabelFlippedDataset` correctness, `FlowerClient` fit/evaluate API.
 - `test_blockchain.py`: Redis round-trip serialization/deserialization, mocked `web3.py` contract calls for `updateClient` and `getClient`.
-- `test_rl_agent.py`: Gymnasium observation/action space dtypes and shapes, reward computation correctness, reputation EMA update, PPO training smoke test.
+- `test_rl_agent.py`: MultiAgentEnv observation/action space dtypes and shapes, reward computation correctness, reputation EMA update, MAPPO training smoke test.
+- `test_integration.py`: End-to-end RLReputationStrategy tests covering initialization, state matrix building, MAPPO inference with dynamic cohort sizes, blockchain interactions, and weighted aggregation (93 tests across 15 test classes).
+
+**GitHub Actions CI**: The `.github/workflows/tests.yml` workflow automatically runs the full pytest suite on every push and pull request, with coverage reporting.
 
 ---
 
@@ -707,6 +723,40 @@ The codebase includes several performance optimizations relevant to running many
 
 ---
 
+## MAPPO Scalability Advantages
+
+R3-FL's Multi-Agent PPO architecture with parameter sharing addresses critical scalability bottlenecks of centralized PPO:
+
+### Problem: Single-Agent PPO Scaling Limits
+
+The original single-agent PPO system used a 100-dimensional action space (one weight per client) that:
+- **Does not scale**: Fixed to exactly 100 clients; cannot adapt to different cohort sizes
+- **High-dimensional bottleneck**: 100-dim action space requires large networks and many gradient steps to learn effectively
+- **Inefficient inference**: Padding non-participating clients creates wasted computation
+- **Requires retraining**: Changing the number of clients necessitates retraining the policy
+
+### Solution: Multi-Agent PPO with Parameter Sharing
+
+MAPPO replaces this with K independent agents (one per participating client) that all share a single policy network:
+
+| Aspect | Single-Agent PPO | MAPPO with Sharing |
+|--------|------------------|-------------------|
+| **Per-agent observation** | (100, 5) padded matrix | (5,) per-agent features only |
+| **Action dimensionality** | 100-dim vector | 1-dim scalar per agent |
+| **Network size** | [256, 256] for 500-dim input | [64, 64] for 5-dim input |
+| **Dynamic cohort sizes** | ❌ Fixed to 100 clients | ✓ K∈[1, 100] without retraining |
+| **Inference cost** | 1 call: O(100) | K calls: O(K) with smaller per-call cost |
+| **Participating-only training** | Padded with unused neurons | Only K agents backprop gradients |
+
+### Practical Impact
+
+- **Flexibility**: The same trained policy works for 10 clients, 50 clients, or 100 clients with zero retraining
+- **Efficiency**: Smaller per-agent networks (5 features instead of 100-dim vectors) train faster and require less VRAM
+- **Transparency**: Per-client inference loop makes per-client weights interpretable (no padding masks)
+- **Scalability**: Parameter sharing bounds memory growth regardless of number of agents
+
+---
+
 ## Scientific Context
 
 R3-FL introduces learning-based trust models to federated learning systems that operate over verifiable decentralized infrastructure. Practical applications include:
@@ -715,7 +765,7 @@ R3-FL introduces learning-based trust models to federated learning systems that 
 - IoT device swarms, where individual devices may be compromised and coordinated attacks (Sybil, noise injection) are operationally realistic.
 - Any edge computing scenario where immutable, tamper-proof reputation history provides accountability guarantees that static aggregation rules cannot.
 
-The key contribution is replacing a hand-tuned mathematical filter with a reward-shaped RL policy that adapts its weighting strategy based on accumulated behavioral evidence — including cross-round memory encoded in on-chain reputation scores.
+The key contribution is replacing a hand-tuned mathematical filter with a reward-shaped Multi-Agent RL policy (MAPPO with parameter sharing) that adapts its weighting strategy based on accumulated behavioral evidence — including cross-round memory encoded in on-chain reputation scores. The multi-agent architecture with shared parameters enables the system to dynamically handle varying client cohort sizes without retraining, addressing a fundamental scalability constraint of centralized RL approaches.
 
 ---
 
