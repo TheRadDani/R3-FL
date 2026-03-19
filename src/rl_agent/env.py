@@ -38,8 +38,8 @@ from ray.rllib.env.multi_agent_env import MultiAgentEnv
 NUM_CLIENTS: int = 100
 """Total number of Federated Learning clients (honest + malicious)."""
 
-NUM_FEATURES: int = 5
-"""Number of observable features per client."""
+NUM_FEATURES: int = 9
+"""Number of observable features per client (5 local + 4 global context)."""
 
 FEATURE_NAMES: list[str] = [
     "accuracy_contribution",
@@ -47,23 +47,37 @@ FEATURE_NAMES: list[str] = [
     "historical_reputation",
     "loss_improvement",
     "update_magnitude",
+    "global_mean_accuracy",
+    "global_mean_similarity",
+    "global_mean_loss_improvement",
+    "global_mean_magnitude",
 ]
-"""Human-readable names for the 5 per-client features.
+"""Human-readable names for the 9 per-client features.
 
 Index mapping:
-    0 — accuracy_contribution : How much this client's update improves the model
-    1 — gradient_similarity   : Cosine similarity of client gradient to global gradient (mapped 0-1)
-    2 — historical_reputation : Exponential moving average of past reputation scores
-    3 — loss_improvement      : Reduction in loss attributable to this client's update
-    4 — update_magnitude      : L2 norm of the gradient update (high values may indicate poisoning)
+    0 — accuracy_contribution      : How much this client's update improves the model
+    1 — gradient_similarity        : Cosine similarity of client gradient to global gradient (mapped 0-1)
+    2 — historical_reputation      : Exponential moving average of past reputation scores
+    3 — loss_improvement           : Reduction in loss attributable to this client's update
+    4 — update_magnitude           : L2 norm of the gradient update (high values may indicate poisoning)
+    5 — global_mean_accuracy       : Mean accuracy_contribution across all clients (broadcast)
+    6 — global_mean_similarity     : Mean gradient_similarity across all clients (broadcast)
+    7 — global_mean_loss_improvement : Mean loss_improvement across all clients (broadcast)
+    8 — global_mean_magnitude      : Mean update_magnitude across all clients (broadcast)
 """
 
-# Feature indices for readability
+# Feature indices for readability — local features
 _ACC = 0
 _SIM = 1
 _REP = 2
 _LOSS = 3
 _MAG = 4
+
+# Feature indices for readability — global context features
+_GACC = 5
+_GSIM = 6
+_GLOSS = 7
+_GMAG = 8
 
 # Reputation update parameters
 _REPUTATION_EMA_ALPHA: float = 0.3
@@ -391,6 +405,23 @@ class FLReputationEnv(MultiAgentEnv):
 
         # Clip to valid observation range in-place — no intermediate array
         np.clip(self._state, 0.0, 1.0, out=self._state)
+
+        # --- Global context features (broadcast means of local features) ---
+        # Computed AFTER clipping so the means reflect the valid [0, 1] range.
+        mean_acc = self._state[:, _ACC].mean()
+        mean_sim = self._state[:, _SIM].mean()
+        mean_loss = self._state[:, _LOSS].mean()
+        mean_mag = self._state[:, _MAG].mean()
+
+        self._state[:, _GACC] = mean_acc
+        self._state[:, _GSIM] = mean_sim
+        self._state[:, _GLOSS] = mean_loss
+        self._state[:, _GMAG] = mean_mag
+
+        # Safety clip for global columns (values derive from clipped locals,
+        # but guard against floating-point edge cases)
+        np.clip(self._state[:, _GACC:_GMAG + 1], 0.0, 1.0,
+                out=self._state[:, _GACC:_GMAG + 1])
 
     def _compute_reward(
         self, weights: np.ndarray

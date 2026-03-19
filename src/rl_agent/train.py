@@ -184,12 +184,12 @@ def build_ppo_config(
             # sgd_minibatch_size=256 balances gradient noise vs. throughput
             sgd_minibatch_size=256,
             num_sgd_iter=10,
-            lr=3e-4,
+            lr=5e-4,
             lambda_=0.95,
             gamma=0.99,
             clip_param=0.2,
-            entropy_coeff=0.01,
-            vf_clip_param=10.0,
+            entropy_coeff=0.005,
+            vf_clip_param=50.0,
             vf_loss_coeff=1.0,
             grad_clip=40.0,
             model={
@@ -200,9 +200,10 @@ def build_ppo_config(
                 # Disable LSTM — this env has no temporal dependency that LSTM helps with;
                 # disabling reduces per-step overhead significantly
                 "use_lstm": False,
-                # vf_share_layers=True shares trunk between policy and value heads,
-                # cutting forward-pass cost roughly in half
-                "vf_share_layers": True,
+                # vf_share_layers=False uses separate networks for policy and value heads.
+                # MAPPO benefits from decoupled actor/critic: the value function sees
+                # global context and needs different representations than the policy head.
+                "vf_share_layers": False,
             },
         )
         .evaluation(

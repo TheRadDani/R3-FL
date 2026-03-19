@@ -36,13 +36,19 @@ An AI agent running inside the aggregation server can learn to distinguish adver
 
 At each communication round, each RL agent (one per participating client) receives an individual observation vector of shape `(5,)`:
 
-| Feature index | Name | Description |
-|---|---|---|
-| 0 | `accuracy_contribution` | Marginal improvement to the global model on a held-out validation set |
-| 1 | `gradient_similarity` | Cosine similarity of the client's flattened gradient vs. the mean gradient, rescaled to [0, 1] |
-| 2 | `historical_reputation` | Exponential moving average (α=0.3) of past reputation, fetched from the blockchain |
-| 3 | `loss_improvement` | Reduction in the global loss attributable to this client's update |
-| 4 | `update_magnitude` | L2 norm of the gradient update, min-max normalized across all clients |
+| Feature index | Name | Scope | Description |
+|---|---|---|---|
+| 0 | `accuracy_contribution` | Local | Marginal improvement to the global model on a held-out validation set |
+| 1 | `gradient_similarity` | Local | Cosine similarity of the client's flattened gradient vs. the mean gradient, rescaled to [0, 1] |
+| 2 | `historical_reputation` | Local | Exponential moving average (α=0.3) of past reputation, fetched from the blockchain |
+| 3 | `loss_improvement` | Local | Reduction in the global loss attributable to this client's update |
+| 4 | `update_magnitude` | Local | L2 norm of the gradient update, min-max normalized across all clients |
+| 5 | `global_mean_accuracy` | Global | Mean `accuracy_contribution` across all 100 clients this round |
+| 6 | `global_mean_similarity` | Global | Mean `gradient_similarity` across all 100 clients this round |
+| 7 | `global_mean_loss_improvement` | Global | Mean `loss_improvement` across all 100 clients this round |
+| 8 | `global_mean_magnitude` | Global | Mean `update_magnitude` across all 100 clients this round |
+
+The global context features give each agent row a reference point against which to judge its own local features, providing the centralized context that stabilizes value-function learning while keeping the actor's input compact.
 
 The state matrix is compactly represented as shape `(K, 5)` where K = number of participating clients (no padding). This eliminates the 100-dimensional action space bottleneck and allows the system to dynamically adapt to varying client cohort sizes. All K agents observe their own row and share a single policy network.
 
@@ -366,7 +372,7 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 | Train batch size | 4000 steps | Reduce if GPU OOM |
 | SGD minibatch | 256 | Balances gradient noise and throughput |
 | SGD iterations | 10 per batch | |
-| Learning rate | 3e-4 | |
+| Learning rate | 5e-4 | Increased for faster initial convergence |
 | Discount (γ) | 0.99 | |
 | GAE (λ) | 0.95 | |
 | Clip parameter | 0.2 | PPO clip |
@@ -375,6 +381,17 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 | Evaluation interval | every 10 iterations | 5 episodes |
 
 The script auto-detects GPU resources. On CUDA machines, all GPUs are allocated to the learner; rollout workers run on CPU only (`num_gpus_per_env_runner=0`) to avoid Ray demanding more GPU budget than a single-GPU machine can supply.
+
+**Architecture improvements (vs. baseline PPO):**
+
+| Design choice | Previous | Current | Rationale |
+|---|---|---|---|
+| Observation features | 5 (local only) | 9 (5 local + 4 global means) | Solves partial observability: each agent sees how its local signals compare to the cohort average |
+| Actor/critic sharing | Shared trunk | Separate networks | Prevents the faster-learning critic from destabilizing policy gradients via shared weights |
+| Network width | [256, 256] | [128, 128] | Right-sized for the now-separated heads; avoids over-parameterization |
+| Learning rate | 3e-4 | 5e-4 | Speeds up initial learning with the richer 9-dim observation |
+| Entropy coefficient | 0.01 | 0.005 | Less exploration pressure once the agent has good global context |
+| VF clip parameter | 10.0 | 50.0 | Prevents value-function updates from being truncated when global reward variance is high |
 
 ### Step 7 — Run the baseline FL simulation
 
