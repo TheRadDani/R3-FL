@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Daniel", email = "daniel@example.com" }
+    { name = "Daniel", email = "ldanielfch@gmail.com" }
 ]
 keywords = [
     "federated-learning",
@@ -67,16 +67,13 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/r3-fl"
-Documentation = "https://r3-fl.readthedocs.io"
-Repository = "https://github.com/yourusername/r3-fl.git"
-"Bug Tracker" = "https://github.com/yourusername/r3-fl/issues"
+Homepage = "https://github.com/TheRadDani/r3-fl"
+Documentation = "https://theraddani.github.io/R3-FL/"
+Repository = "https://github.com/TheRadDani/r3-fl.git"
+"Bug Tracker" = "https://github.com/TheRadDani/r3-fl/issues"
 
 [tool.setuptools]
-packages = ["src"]
-
-[tool.setuptools.package-dir]
-"" = "."
+package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 where = ["."]
