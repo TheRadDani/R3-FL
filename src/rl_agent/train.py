@@ -1,8 +1,9 @@
-"""Ray RLlib PPO training script for the FLReputationEnv.
+"""Ray RLlib MAPPO training script for the FLReputationEnv.
 
-Trains a PPO agent to learn optimal aggregation weights for a Federated
-Learning system with adversarial clients.  The agent learns to upweight
-honest clients and downweight malicious ones.
+Trains a Multi-Agent PPO (MAPPO) system with parameter sharing to learn
+optimal aggregation weights for a Federated Learning system with adversarial
+clients.  Each agent corresponds to one FL client and shares a single policy
+network, learning to upweight honest clients and downweight malicious ones.
 
 Performance features:
     - Multi-GPU: num_gpus = torch.cuda.device_count() (graceful CPU fallback)
@@ -28,9 +29,12 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import ray
 import torch
+from gymnasium import spaces
 from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.policy.policy import PolicySpec
 from ray.tune.registry import register_env
 
 # Import the custom environment
@@ -189,9 +193,9 @@ def build_ppo_config(
             vf_loss_coeff=1.0,
             grad_clip=40.0,
             model={
-                # fcnet_hiddens sized to observation space: NUM_CLIENTS * NUM_FEATURES = 500 inputs
-                # Two 256-wide hidden layers provide sufficient capacity without over-parameterizing
-                "fcnet_hiddens": [256, 256],
+                # fcnet_hiddens sized to per-agent observation space: NUM_FEATURES = 5 inputs per agent (parameter-shared MAPPO)
+                # Two 64-wide hidden layers provide sufficient capacity without over-parameterizing
+                "fcnet_hiddens": [64, 64],
                 "fcnet_activation": "relu",
                 # Disable LSTM — this env has no temporal dependency that LSTM helps with;
                 # disabling reduces per-step overhead significantly
@@ -204,6 +208,16 @@ def build_ppo_config(
         .evaluation(
             evaluation_interval=10,
             evaluation_duration=5,
+        )
+        .multi_agent(
+            policies={
+                "shared_policy": PolicySpec(
+                    observation_space=spaces.Box(0.0, 1.0, shape=(NUM_FEATURES,), dtype=np.float32),
+                    action_space=spaces.Box(0.0, 1.0, shape=(1,), dtype=np.float32),
+                ),
+            },
+            policy_mapping_fn=lambda agent_id, episode, worker=None, **kwargs: "shared_policy",
+            policies_to_train=["shared_policy"],
         )
     )
 
