@@ -45,10 +45,50 @@ AVAILABLE_STRATEGIES = [
     "fedavg", "krum", "median", "trimmed_mean", "fltrust", "rl_reputation",
 ]
 DEFAULTS = dict(
-    num_rounds=5, num_clients=20, malicious_fraction=0.3,
-    fraction_fit=0.2, target_accuracy=0.7, seed=42,
+    num_rounds=8, num_clients=20, malicious_fraction=0.3,
+    fraction_fit=0.5, target_accuracy=0.7, seed=42,
     trimmed_beta=0.1, batch_size=32, dirichlet_alpha=0.5,
 )
+
+
+def _close_tbx_writers() -> None:
+    """Close all live TensorboardX EventFileWriter instances while threads work.
+
+    TBX's FileWriter.__init__ registers an atexit handler that calls
+    event_writer.close(), which internally calls _worker.stop(), which puts a
+    shutdown signal onto a multiprocessing.Queue.  At interpreter shutdown,
+    Queue.put() tries to lazily start a background thread via _start_thread()
+    and fails with RuntimeError because no new threads can be created.
+
+    Closing every EventFileWriter that still has _closed=False HERE — while
+    the interpreter is in its normal running state — sets _closed=True on each
+    instance.  The atexit handler then hits the `if not self._closed:` guard
+    and returns immediately as a no-op, preventing the RuntimeError.
+
+    This must be called AFTER Flower's start_simulation() (which calls
+    ray.shutdown() and therefore stops all Ray worker threads) but BEFORE
+    the process begins interpreter shutdown.
+    """
+    try:
+        from tensorboardX.event_file_writer import EventFileWriter as _EFW
+    except ImportError:
+        return  # tensorboardX not installed; nothing to do
+
+    closed_count = 0
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, _EFW) and not obj._closed:
+                obj.close()
+                closed_count += 1
+        except Exception:
+            pass  # best-effort; never raise during cleanup
+
+    if closed_count:
+        logger.debug(
+            "Pre-shutdown: closed %d TensorboardX EventFileWriter(s) to prevent "
+            "atexit RuntimeError.",
+            closed_count,
+        )
 
 
 def _benchmark_client_resources(num_concurrent_clients: int = 10) -> Dict[str, float]:
@@ -510,6 +550,15 @@ def run_single_benchmark(strategy_name, num_clients, num_rounds,
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     logger.info("Results saved to %s", out_path)
+
+    # Close any live TensorboardX EventFileWriter instances NOW, while threads
+    # can still be started.  TBX registers an atexit handler per FileWriter
+    # that calls close() → _worker.stop() → queue.put(shutdown_signal).
+    # multiprocessing.Queue.put() lazily starts a background thread; at
+    # interpreter shutdown that start fails with RuntimeError.  Calling
+    # close() here while the interpreter is healthy sets _closed=True, making
+    # the atexit handler a no-op (guarded by `if not self._closed`).
+    _close_tbx_writers()
 
     # Attempt a clean PPO shutdown.  Flower's start_simulation calls
     # ray.shutdown() internally, which kills all Ray workers.  If ppo_algo

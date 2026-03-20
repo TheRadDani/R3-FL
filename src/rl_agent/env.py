@@ -134,6 +134,11 @@ class FLReputationEnv(MultiAgentEnv):
         # Agent IDs — required by MultiAgentEnv
         self._agent_ids = {f"agent_{i}" for i in range(NUM_CLIENTS)}
 
+        # Pre-computed ordered agent ID list — avoids f-string formatting on every
+        # step() call.  100 agents × many iterations = meaningful savings in CPython.
+        # Use this list (not the set above) wherever iteration order matters.
+        self._agent_id_list: list[str] = [f"agent_{i}" for i in range(NUM_CLIENTS)]
+
         # Per-agent spaces — each agent sees its own feature vector and
         # outputs a single scalar weight. Explicit float32 dtype avoids
         # RLlib's silent float64→float32 downcast which burns a memcpy.
@@ -242,13 +247,15 @@ class FLReputationEnv(MultiAgentEnv):
         # Generate the first observation (writes into self._state in-place)
         self._generate_state(initial=True)
 
-        # Build per-agent observation and info dicts
+        # Build per-agent observation and info dicts using the pre-built id list
+        # to avoid repeated f-string allocation in the hot path.
         obs_dict = {
-            f"agent_{i}": self._state[i].copy() for i in range(NUM_CLIENTS)
+            aid: self._state[i].copy()
+            for i, aid in enumerate(self._agent_id_list)
         }
         info_dict = {
-            f"agent_{i}": {"round": 0, "num_malicious": num_malicious}
-            for i in range(NUM_CLIENTS)
+            aid: {"round": 0, "num_malicious": num_malicious}
+            for aid in self._agent_id_list
         }
         return obs_dict, info_dict
 
@@ -272,9 +279,10 @@ class FLReputationEnv(MultiAgentEnv):
             where each is keyed by agent ID. terminateds and truncateds also
             include an "__all__" key.
         """
-        # Parse per-agent actions into a single weight vector
+        # Parse per-agent actions into a single weight vector using the pre-built
+        # id list to avoid repeated f-string formatting on every step call.
         weights = np.array(
-            [float(action_dict[f"agent_{i}"][0]) for i in range(NUM_CLIENTS)],
+            [float(action_dict[aid][0]) for aid in self._agent_id_list],
             dtype=np.float32,
         )
 
@@ -299,34 +307,30 @@ class FLReputationEnv(MultiAgentEnv):
 
         terminated = self._round >= self.max_rounds
 
-        # Build per-agent return dicts
+        # Build per-agent return dicts using the pre-built id list to avoid
+        # repeated f-string formatting — at 100 agents per step this matters.
         obs_dict = {
-            f"agent_{i}": self._state[i].copy() for i in range(NUM_CLIENTS)
+            aid: self._state[i].copy()
+            for i, aid in enumerate(self._agent_id_list)
         }
 
         # Cooperative reward: every agent receives the same global reward
-        rewards_dict = {
-            f"agent_{i}": reward for i in range(NUM_CLIENTS)
-        }
+        rewards_dict = {aid: reward for aid in self._agent_id_list}
 
-        terminateds: dict[str, bool] = {
-            f"agent_{i}": terminated for i in range(NUM_CLIENTS)
-        }
+        terminateds: dict[str, bool] = {aid: terminated for aid in self._agent_id_list}
         terminateds["__all__"] = terminated
 
-        truncateds: dict[str, bool] = {
-            f"agent_{i}": False for i in range(NUM_CLIENTS)
-        }
+        truncateds: dict[str, bool] = {aid: False for aid in self._agent_id_list}
         truncateds["__all__"] = False
 
-        infos = {
-            f"agent_{i}": {
-                "round": self._round,
-                "cumulative_reward": self._cumulative_reward,
-                **reward_info,
-            }
-            for i in range(NUM_CLIENTS)
+        # Build the shared info body once — then reference it per agent.
+        # Each agent gets its own dict so callers can mutate without cross-contamination.
+        _info_body = {
+            "round": self._round,
+            "cumulative_reward": self._cumulative_reward,
+            **reward_info,
         }
+        infos = {aid: dict(_info_body) for aid in self._agent_id_list}
 
         if self.render_mode == "human":
             self.render()

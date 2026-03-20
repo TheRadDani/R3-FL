@@ -13,6 +13,8 @@ Performance features:
     - CUDA timing around policy inference (exposed via --time-inference flag)
     - Triton reward normalization kernel imported with graceful fallback
     - Batch sizes tuned for throughput (train_batch=4000, minibatch=256)
+    - batch_mode=truncate_episodes + rollout_fragment_length=100 drops the per-worker
+      observation buffer to 100 × 100 agents = 10,000 obs per fragment, just below the 250K RLlib warning threshold
 
 Usage:
     python -m src.rl_agent.train
@@ -170,16 +172,42 @@ def build_ppo_config(
         .env_runners(
             # Scale workers to CPU count for maximum rollout throughput
             num_env_runners=num_workers,
-            # rollout_fragment_length="auto" lets RLlib derive the per-worker
-            # fragment length from train_batch_size and num_env_runners, avoiding
-            # the ValueError when the manual value doesn't divide evenly.
-            rollout_fragment_length="auto",
+            # rollout_fragment_length=100: explicit value instead of "auto".
+            #
+            # Key insight: fragment_length (100) < max_rounds (200), so with
+            # batch_mode="truncate_episodes" each episode is cut at step 100
+            # before it can complete.  The per-episode observation buffer never
+            # grows past 100 env-steps × 100 agents = 10,000 agent-obs, just
+            # below the 250K RLlib warning threshold.
+            #
+            # Collection speed: 8 workers × 100 env-steps = 800 env-steps per
+            # round.  To fill train_batch_size=4000 env-steps only 5 collection
+            # rounds are needed (4000 / 800 = 5), keeping worker round-trips low
+            # and restoring ~1-2 min/iter throughput.  By contrast, a fragment
+            # length of 5 required 100 collection rounds (4000 / (8×5) = 100),
+            # which multiplied worker communication overhead ~20× (~6:30/iter).
+            rollout_fragment_length=100,
+            # truncate_episodes: release rollout fragments at rollout_fragment_length
+            # boundaries instead of waiting for full episode completion.
+            # With 100 agents × 200 steps, complete_episodes forced buffering
+            # 20,000 agent-observations before any update — causing the
+            # "More than 20000 observations buffered" warning and ~1:48/iter.
+            # truncate_episodes is safe here because reward is per-step (not
+            # episode-terminal), so the PPO value target is valid at any truncation.
+            batch_mode="truncate_episodes",
+            # num_envs_per_env_runner=1: explicit document of the implicit default.
+            # Prevents future RLlib version defaults from silently changing behaviour.
+            num_envs_per_env_runner=1,
             # num_gpus_per_env_runner replaces the deprecated num_gpus_per_worker
             # parameter (previously passed via .resources()) for rollout workers.
             num_gpus_per_env_runner=num_gpus_per_worker,
         )
         .training(
-            # train_batch_size=4000 requires ~2-3 GB VRAM on GPU; reduce if OOM
+            # train_batch_size=4000: kept from original config.
+            # With truncate_episodes and rollout_fragment_length=100, each of
+            # the 8 workers delivers 100 env steps (100 × 100 agents = 10,000
+            # agent-obs).  5 collection rounds × 8 workers = 4,000 env-steps
+            # total per batch.  SGD update size unchanged; only collection is fast.
             train_batch_size=4000,
             # sgd_minibatch_size=256 balances gradient noise vs. throughput
             sgd_minibatch_size=256,

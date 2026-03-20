@@ -619,11 +619,23 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         """
         K = len(accuracies)
         state = np.zeros((K, NUM_FEATURES), dtype=np.float32)
+
+        # Local features (indices 0–4)
         state[:, 0] = accuracies
         state[:, 1] = similarities
         state[:, 2] = reputations
         state[:, 3] = loss_improvements
         state[:, 4] = magnitudes
+
+        # Global context features (indices 5–8): mean of each local feature,
+        # broadcast to every row so every client sees the same global context.
+        # Matches the feature layout the PPO was trained on in env.py (_GACC=5,
+        # _GSIM=6, _GLOSS=7, _GMAG=8).
+        state[:, 5] = float(np.mean(accuracies))
+        state[:, 6] = float(np.mean(similarities))
+        state[:, 7] = float(np.mean(loss_improvements))
+        state[:, 8] = float(np.mean(magnitudes))
+
         return np.clip(state, 0.0, 1.0)
 
     # ------------------------------------------------------------------
@@ -661,7 +673,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             try:
                 raw_weights = np.zeros(K, dtype=np.float32)
                 for i in range(K):
-                    obs_i = state[i]  # shape (NUM_FEATURES,) = (5,)
+                    obs_i = state[i]  # shape (NUM_FEATURES,) = (9,)
                     action = self.ppo_algo.compute_single_action(
                         obs_i, policy_id="shared_policy"
                     )
