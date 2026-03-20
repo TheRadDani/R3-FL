@@ -20,7 +20,7 @@ The system consists of three tightly integrated layers:
 
 1. **Federated Learning core** (Flower): A simulation of up to 100 clients training a CNN on FEMNIST. Clients may be honest, label-flipping, or noise-injecting. The server uses one of six pluggable aggregation strategies.
 
-2. **Reinforcement Learning agent** (Ray RLlib / MAPPO): A custom Ray `MultiAgentEnv` environment (`FLReputationEnv`) models one FL aggregation round as a single RL step. Each FL client maps to one RL agent; all agents share a single policy network. The agent observes a (K×5) feature matrix (where K = number of participating clients) and each agent independently outputs a scalar aggregation weight. The system dynamically adapts to varying client cohort sizes without padding or retraining. It is trained offline, then loaded as a frozen policy at FL simulation time.
+2. **Reinforcement Learning agent** (Ray RLlib / MAPPO): A custom Ray `MultiAgentEnv` environment (`FLReputationEnv`) models one FL aggregation round as a single RL step. Each FL client maps to one RL agent; all agents share a single policy network. The agent observes a (K×9) feature matrix (where K = number of participating clients) and each agent independently outputs a scalar aggregation weight. The system dynamically adapts to varying client cohort sizes without padding or retraining. It is trained offline, then loaded as a frozen policy at FL simulation time.
 
 3. **Blockchain reputation ledger** (Ethereum / Hardhat): A Solidity smart contract (`ReputationManager`) stores every client's integer reputation score, gradient content-ID hash, and timestamp immutably on-chain. Redis stores the actual serialized model tensors off-chain; only the UUID key is committed on-chain to avoid gas costs for large payloads.
 
@@ -34,7 +34,7 @@ An AI agent running inside the aggregation server can learn to distinguish adver
 
 ### State Vector
 
-At each communication round, each RL agent (one per participating client) receives an individual observation vector of shape `(5,)`:
+At each communication round, each RL agent (one per participating client) receives an individual observation vector of shape `(9,)`:
 
 | Feature index | Name | Scope | Description |
 |---|---|---|---|
@@ -43,30 +43,30 @@ At each communication round, each RL agent (one per participating client) receiv
 | 2 | `historical_reputation` | Local | Exponential moving average (α=0.3) of past reputation, fetched from the blockchain |
 | 3 | `loss_improvement` | Local | Reduction in the global loss attributable to this client's update |
 | 4 | `update_magnitude` | Local | L2 norm of the gradient update, min-max normalized across all clients |
-| 5 | `global_mean_accuracy` | Global | Mean `accuracy_contribution` across all 100 clients this round |
-| 6 | `global_mean_similarity` | Global | Mean `gradient_similarity` across all 100 clients this round |
-| 7 | `global_mean_loss_improvement` | Global | Mean `loss_improvement` across all 100 clients this round |
-| 8 | `global_mean_magnitude` | Global | Mean `update_magnitude` across all 100 clients this round |
+| 5 | `global_mean_accuracy` | Global | Mean `accuracy_contribution` across all participating clients this round |
+| 6 | `global_mean_similarity` | Global | Mean `gradient_similarity` across all participating clients this round |
+| 7 | `global_mean_loss_improvement` | Global | Mean `loss_improvement` across all participating clients this round |
+| 8 | `global_mean_magnitude` | Global | Mean `update_magnitude` across all participating clients this round |
 
-The global context features give each agent row a reference point against which to judge its own local features, providing the centralized context that stabilizes value-function learning while keeping the actor's input compact.
+The global context features (indices 5–8) give each agent a reference point against which to judge its own local features, providing the centralized context that stabilizes value-function learning while keeping the actor's input compact.
 
-The state matrix is compactly represented as shape `(K, 5)` where K = number of participating clients (no padding). This eliminates the 100-dimensional action space bottleneck and allows the system to dynamically adapt to varying client cohort sizes. All K agents observe their own row and share a single policy network.
+The state matrix is compactly represented as shape `(K, 9)` where K = number of participating clients (no padding). This eliminates the large centralized action space bottleneck and allows the system to dynamically adapt to varying client cohort sizes. All K agents observe their own row and share a single policy network.
 
 ### Reward Function
 
 ```
-R = α · (weighted_accuracy) − β · (attack_impact) − γ · (entropy_penalty)
+R = α · (weighted_accuracy) − β · (attack_impact) − λ · |weight_sum − 1|
 ```
 
 Where:
 - `weighted_accuracy` is the dot product of weights and per-client accuracy contributions, normalized by total weight.
 - `attack_impact` is the fraction of total aggregation weight assigned to clients whose ground-truth identity is malicious.
-- `entropy_penalty` (coefficient 0.05) gently penalizes uniform weight distributions, encouraging the agent to discriminate.
+- `|weight_sum − 1|` (coefficient λ=0.01) penalizes raw weight vectors whose sum deviates far from 1, resolving the scale ambiguity introduced by L1 normalization and encouraging the agent to discriminate rather than collapse all weights toward zero.
 - Default: α=0.6, β=0.4.
 
 ### Aggregation Weights
 
-In MAPPO with parameter sharing, each agent independently outputs a continuous scalar weight in [0, 1]. The K participating clients each produce one weight via the shared policy. These K weights are clipped to [0, 1] and L1-normalized to sum to 1 before weighted parameter averaging. This per-agent scalar output eliminates the 100-dimensional centralized action space bottleneck and scales naturally to any client cohort size.
+In MAPPO with parameter sharing, each agent independently outputs a continuous scalar weight in [0, 1]. The K participating clients each produce one weight via the shared policy. These K weights are clipped to [0, 1] and L1-normalized to sum to 1 before weighted parameter averaging. This per-agent scalar output eliminates the large centralized action space bottleneck and scales naturally to any client cohort size.
 
 ### Reputation Update (EMA)
 
@@ -99,7 +99,7 @@ flowchart TD
     subgraph Server["FL Server — RLReputationStrategy"]
         FM["1. Receive FitRes\n(model updates)"]
         BC["2. Fetch reputations\nfrom blockchain"]
-        SM["3. Build K×5\nstate matrix"]
+        SM["3. Build K×9\nstate matrix"]
         RL["4. MAPPO inference\n(per-client loop)"]
         WA["5. Weighted average\n(chunked, float32)"]
         BU["6. Update blockchain\n+ Redis"]
@@ -124,7 +124,7 @@ flowchart TD
 | `FemnistCNN` | `src/fl_core/dataset.py` | 2-layer CNN, 62-class FEMNIST classifier; shared architecture across all clients and server |
 | `FlowerClient` | `src/fl_core/client.py` | Honest or malicious Flower `NumPyClient`; executes local SGD with optional AMP and gradient checkpointing |
 | `FedAvg server` | `src/fl_core/server.py` | Baseline Flower simulation: 100 clients, 30% malicious (15 label flippers + 15 noise injectors), 10 rounds |
-| `FLReputationEnv` | `src/rl_agent/env.py` | Custom Ray `MultiAgentEnv`; one step = one FL round; per-agent (K,5) observations and scalar actions; dict-based API (obs_dict, action_dict, rewards_dict); all agents share reward |
+| `FLReputationEnv` | `src/rl_agent/env.py` | Custom Ray `MultiAgentEnv`; one step = one FL round; per-agent (K,9) observations and scalar actions; dict-based API (obs_dict, action_dict, rewards_dict); all agents share reward |
 | `train.py` | `src/rl_agent/train.py` | Ray RLlib MAPPO training loop with parameter sharing; saves checkpoints to `checkpoints/fl_reputation_ppo/` |
 | `kernels.py` | `src/rl_agent/kernels.py` | Triton JIT kernel for reward normalization; graceful PyTorch fallback |
 | `ReputationManager.sol` | `src/blockchain/contracts/` | Solidity contract: admin-gated write, open read, batch update, `ClientUpdated` events |
@@ -155,7 +155,7 @@ R3-FL/
 │   │   └── server.py           # Baseline FL simulation (FedAvg, 100 clients, 10 rounds)
 │   │
 │   ├── rl_agent/
-│   │   ├── env.py              # FLReputationEnv: Ray MultiAgentEnv (K×5 obs per agent, scalar actions, shared policy)
+│   │   ├── env.py              # FLReputationEnv: Ray MultiAgentEnv (K×9 obs per agent, scalar actions, shared policy)
 │   │   ├── train.py            # MAPPO training loop via Ray RLlib; parameter sharing; CLI with --iterations, --num-workers
 │   │   ├── kernels.py          # Triton reward-normalization kernel + PyTorch fallback + RunningMeanStd
 │   │   └── __init__.py
@@ -207,9 +207,9 @@ R3-FL/
 | CUDA (optional) | 11.8+ | GPU acceleration for training and simulation |
 
 > **Hardware requirements for RL training:**
-> The default worker count is `max(4, cpu_count - 2)`. A machine with 8+ CPU cores and 16 GB RAM is sufficient for a minimal run.
+> The default worker count is `min(max(1, cpu_count - 2), 8)`. A machine with 8+ CPU cores and 16 GB RAM is sufficient for a minimal run.
 >
-> - **Multi-GPU server** (original target): All GPUs go to the learner; workers scale to CPU count. You can push `--num-workers` to 30+ if cores are available.
+> - **Multi-GPU server** (original target): All GPUs go to the learner; workers scale to CPU count. You can push `--num-workers` to 8 (the cap) if cores are available.
 > - **Single-GPU workstation** (e.g., laptop with RTX 4090): The default configuration works without changes — the learner uses the GPU for policy updates and workers run entirely on CPU. Recommended: keep `--num-workers` at or below `cpu_count - 2`.
 >
 > If you see Ray warnings such as `"Insufficient GPUs"` or tasks stuck in `PENDING` waiting for GPU resources, a prior version of the config was assigning fractional GPUs to workers. Ensure you are running the current `train.py` (workers use `num_gpus_per_env_runner=0`) or pass `--num-workers 4` to reduce scheduling pressure.
@@ -339,7 +339,7 @@ python src/rl_agent/train.py
 | Flag | Default | Description |
 |---|---|---|
 | `--iterations` | `50` | Number of PPO training iterations |
-| `--num-workers` | auto | Parallel rollout workers (default: `max(4, cpu_count - 2)`) |
+| `--num-workers` | auto | Parallel rollout workers (default: `min(max(1, cpu_count - 2), 8)`) |
 | `--time-inference` | off | Wrap each iteration with CUDA synchronize timing to profile GPU bottlenecks |
 
 > **Single-GPU note:** The script auto-detects your CPU count and sets `num_env_runners` accordingly. Rollout workers run on CPU; only the learner process uses the GPU. On machines with fewer cores you can cap workers explicitly:
@@ -367,7 +367,7 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 | Algorithm | MAPPO | Multi-Agent PPO with parameter sharing |
 | Framework | PyTorch | Explicit; required for AMP |
 | Multi-Agent | Parameter sharing | Single policy network shared across all K agents |
-| Per-agent obs space | (5,) | 5 features: accuracy, similarity, reputation, loss, magnitude |
+| Per-agent obs space | (9,) | 9 features: 5 local (accuracy, similarity, reputation, loss, magnitude) + 4 global means |
 | Per-agent action space | (1,) | Scalar weight in [0, 1] |
 | Train batch size | 4000 steps | Reduce if GPU OOM |
 | SGD minibatch | 256 | Balances gradient noise and throughput |
@@ -376,11 +376,27 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 | Discount (γ) | 0.99 | |
 | GAE (λ) | 0.95 | |
 | Clip parameter | 0.2 | PPO clip |
-| Network | [64, 64] FC | Sized for 5-feature per-agent inputs (not 100-dim centralized) |
-| Rollout fragment | auto | Derived from train batch and num_env_runners |
+| Entropy coefficient | 0.005 | Reduced exploration pressure with richer 9-dim observation |
+| VF clip parameter | 50.0 | Prevents value-function updates being truncated under high reward variance |
+| VF loss coefficient | 1.0 | |
+| Gradient clip | 40.0 | |
+| Network | [64, 64] FC | Sized for 9-feature per-agent inputs (not a large centralized input) |
+| LSTM | enabled | `use_lstm=True`, `max_seq_len=20`; see Sequential Memory section below |
+| Rollout fragment | 100 steps | Explicit; avoids the 250K RLlib observation-buffer warning |
+| Batch mode | truncate_episodes | Releases fragments at 100-step boundaries for throughput |
 | Evaluation interval | every 10 iterations | 5 episodes |
 
 The script auto-detects GPU resources. On CUDA machines, all GPUs are allocated to the learner; rollout workers run on CPU only (`num_gpus_per_env_runner=0`) to avoid Ray demanding more GPU budget than a single-GPU machine can supply.
+
+#### Sequential Memory (LSTM)
+
+Setting `"use_lstm": True` in the RLlib model config wraps the `[64, 64]` fully-connected policy in an LSTM cell. Instead of treating each FL round as an independent observation, the LSTM threads a hidden state vector across consecutive rollout steps. Within each training sequence the agent therefore sees a window of `max_seq_len=20` consecutive FL rounds rather than a single snapshot.
+
+**What `max_seq_len=20` means:** During training, RLlib unrolls the LSTM over sequences of 20 time steps drawn from the collected rollout. The LSTM's hidden state accumulates behavioral evidence across those 20 FL rounds before gradients are computed. This means a training example spans a 20-round window of the FL trajectory, not a single step.
+
+**Why this helps:** Many adaptive poisoning strategies are invisible on any single round — a slow-drift attacker gradually inflates its `update_magnitude` over many rounds, staying below single-round detection thresholds. A Markovian policy (MLP without memory) cannot distinguish this from noise. The LSTM's hidden state encodes the trajectory of each agent's behavioral signals over time, making slow-drift poisoning, gradual reputation erosion, and oscillating attack strategies detectable patterns rather than noise.
+
+**Inference implications:** At FL simulation time (`RLReputationStrategy`), `compute_single_action` is called once per participating client per round using the stateless API (no explicit hidden state threading). For full sequential advantage at inference, the LSTM hidden state should ideally be carried forward between rounds. The current inference path uses the default RLlib stateless mode, which resets the hidden state each round; threading state explicitly across rounds is a planned improvement that would maximize the benefit of the trained LSTM memory.
 
 **Architecture improvements (vs. baseline PPO):**
 
@@ -388,7 +404,8 @@ The script auto-detects GPU resources. On CUDA machines, all GPUs are allocated 
 |---|---|---|---|
 | Observation features | 5 (local only) | 9 (5 local + 4 global means) | Solves partial observability: each agent sees how its local signals compare to the cohort average |
 | Actor/critic sharing | Shared trunk | Separate networks | Prevents the faster-learning critic from destabilizing policy gradients via shared weights |
-| Network width | [256, 256] | [128, 128] | Right-sized for the now-separated heads; avoids over-parameterization |
+| Network width | [256, 256] | [64, 64] | Right-sized for the separated heads operating on 9-dim per-agent input; avoids over-parameterization |
+| Sequential memory | None (MLP) | LSTM (`max_seq_len=20`) | Enables detection of slow-drift poisoning and temporal attack patterns invisible to Markovian policies |
 | Learning rate | 3e-4 | 5e-4 | Speeds up initial learning with the richer 9-dim observation |
 | Entropy coefficient | 0.01 | 0.005 | Less exploration pressure once the agent has good global context |
 | VF clip parameter | 10.0 | 50.0 | Prevents value-function updates from being truncated when global reward variance is high |
@@ -430,7 +447,7 @@ The `RLReputationStrategy` performs these steps each round:
 2. Maps each Flower CID to a deterministic Ethereum address.
 3. Calls `getClient()` on `ReputationManager` to fetch historical reputation scores.
 4. Computes cosine gradient similarity and L2 magnitude for each client.
-5. Assembles the compact (K×5) state matrix where K = number of participating clients.
+5. Assembles the compact (K×9) state matrix where K = number of participating clients.
 6. Performs per-client MAPPO inference: loops over K clients, calls `ppo_algo.compute_single_action(obs_i, policy_id="shared_policy")` for each agent, collects scalar weights.
 7. Performs weighted average of model parameters (chunked, 10 clients per chunk, float32 accumulation).
 8. Uploads the aggregated model to Redis; records the UUID key.
@@ -474,7 +491,7 @@ python scripts/run_benchmarks.py [OPTIONS]
 | Flag | Default | Description |
 |---|---|---|
 | `--strategies` | `all` | Space-separated strategy names, or `all` to run every strategy |
-| `--num-rounds` | `5` | Number of FL communication rounds per strategy |
+| `--num-rounds` | `8` | Number of FL communication rounds per strategy |
 | `--num-clients` | `20` | Total number of simulated clients |
 | `--malicious-fraction` | `0.3` | Fraction of clients that are malicious (e.g., `0.3` = 30%) |
 | `--attack-type` | `label_flip` | Attack type: `label_flip` or `noise_inject` |
@@ -680,6 +697,7 @@ The contract address is resolved in this priority order:
 1. Explicit `contract_address` argument
 2. Module-level singleton set by `deploy_contract()`
 3. `CONTRACT_ADDRESS` environment variable
+4. `address` field in `deployment.json` at the project root
 
 ---
 
@@ -746,9 +764,9 @@ R3-FL's Multi-Agent PPO architecture with parameter sharing addresses critical s
 
 ### Problem: Single-Agent PPO Scaling Limits
 
-The original single-agent PPO system used a 100-dimensional action space (one weight per client) that:
+The original single-agent PPO system used a large centralized action space (one weight per client) that:
 - **Does not scale**: Fixed to exactly 100 clients; cannot adapt to different cohort sizes
-- **High-dimensional bottleneck**: 100-dim action space requires large networks and many gradient steps to learn effectively
+- **High-dimensional bottleneck**: Large action space requires large networks and many gradient steps to learn effectively
 - **Inefficient inference**: Padding non-participating clients creates wasted computation
 - **Requires retraining**: Changing the number of clients necessitates retraining the policy
 
@@ -758,17 +776,17 @@ MAPPO replaces this with K independent agents (one per participating client) tha
 
 | Aspect | Single-Agent PPO | MAPPO with Sharing |
 |--------|------------------|-------------------|
-| **Per-agent observation** | (100, 5) padded matrix | (5,) per-agent features only |
-| **Action dimensionality** | 100-dim vector | 1-dim scalar per agent |
-| **Network size** | [256, 256] for 500-dim input | [64, 64] for 5-dim input |
-| **Dynamic cohort sizes** | ❌ Fixed to 100 clients | ✓ K∈[1, 100] without retraining |
-| **Inference cost** | 1 call: O(100) | K calls: O(K) with smaller per-call cost |
+| **Per-agent observation** | (NUM_CLIENTS, 9) padded matrix | (9,) per-agent features only |
+| **Action dimensionality** | NUM_CLIENTS-dim vector | 1-dim scalar per agent |
+| **Network size** | [256, 256] for large padded input | [64, 64] for 9-dim input |
+| **Dynamic cohort sizes** | Fixed to NUM_CLIENTS | K∈[1, 100] without retraining |
+| **Inference cost** | 1 call: O(NUM_CLIENTS) | K calls: O(K) with smaller per-call cost |
 | **Participating-only training** | Padded with unused neurons | Only K agents backprop gradients |
 
 ### Practical Impact
 
 - **Flexibility**: The same trained policy works for 10 clients, 50 clients, or 100 clients with zero retraining
-- **Efficiency**: Smaller per-agent networks (5 features instead of 100-dim vectors) train faster and require less VRAM
+- **Efficiency**: Smaller per-agent networks (9 features instead of padded NUM_CLIENTS-dim vectors) train faster and require less VRAM
 - **Transparency**: Per-client inference loop makes per-client weights interpretable (no padding masks)
 - **Scalability**: Parameter sharing bounds memory growth regardless of number of agents
 
@@ -782,7 +800,7 @@ R3-FL introduces learning-based trust models to federated learning systems that 
 - IoT device swarms, where individual devices may be compromised and coordinated attacks (Sybil, noise injection) are operationally realistic.
 - Any edge computing scenario where immutable, tamper-proof reputation history provides accountability guarantees that static aggregation rules cannot.
 
-The key contribution is replacing a hand-tuned mathematical filter with a reward-shaped Multi-Agent RL policy (MAPPO with parameter sharing) that adapts its weighting strategy based on accumulated behavioral evidence — including cross-round memory encoded in on-chain reputation scores. The multi-agent architecture with shared parameters enables the system to dynamically handle varying client cohort sizes without retraining, addressing a fundamental scalability constraint of centralized RL approaches.
+The key contribution is replacing a hand-tuned mathematical filter with a reward-shaped Multi-Agent RL policy (MAPPO with parameter sharing) that adapts its weighting strategy based on accumulated behavioral evidence — including cross-round memory encoded in on-chain reputation scores and, with LSTM, within-sequence temporal patterns. The multi-agent architecture with shared parameters enables the system to dynamically handle varying client cohort sizes without retraining, addressing a fundamental scalability constraint of centralized RL approaches.
 
 ---
 

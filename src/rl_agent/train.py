@@ -91,6 +91,7 @@ def env_creator(env_config: dict) -> FLReputationEnv:
         beta=env_config.get("beta", 0.4),
         malicious_fraction=env_config.get("malicious_fraction", 0.3),
         max_rounds=env_config.get("max_rounds", 200),
+        num_clients=env_config.get("num_clients", NUM_CLIENTS),
     )
 
 
@@ -221,13 +222,16 @@ def build_ppo_config(
             vf_loss_coeff=1.0,
             grad_clip=40.0,
             model={
-                # fcnet_hiddens sized to per-agent observation space: NUM_FEATURES = 5 inputs per agent (parameter-shared MAPPO)
+                # fcnet_hiddens sized to per-agent observation space: NUM_FEATURES = 9 inputs per agent (parameter-shared MAPPO)
                 # Two 64-wide hidden layers provide sufficient capacity without over-parameterizing
                 "fcnet_hiddens": [64, 64],
                 "fcnet_activation": "relu",
-                # Disable LSTM — this env has no temporal dependency that LSTM helps with;
-                # disabling reduces per-step overhead significantly
-                "use_lstm": False,
+                # Enable LSTM so the agent retains memory of client behaviour across FL rounds.
+                # max_seq_len=20 means the LSTM unrolls over 20 consecutive rounds per training
+                # sequence, giving the policy a wide enough window to detect slow-drift poisoning
+                # attacks (e.g., clients that gradually increase update magnitudes over many rounds).
+                "use_lstm": True,
+                "max_seq_len": 20,
                 # vf_share_layers=False uses separate networks for policy and value heads.
                 # MAPPO benefits from decoupled actor/critic: the value function sees
                 # global context and needs different representations than the policy head.
