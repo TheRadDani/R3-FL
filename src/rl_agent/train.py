@@ -368,8 +368,9 @@ def build_ppo_config(
             # agent-obs).  5 collection rounds × 8 workers = 4,000 env-steps
             # total per batch.  SGD update size unchanged; only collection is fast.
             train_batch_size=4000,
-            # sgd_minibatch_size=256 balances gradient noise vs. throughput
-            sgd_minibatch_size=256,
+            # mini_batch_size_per_learner replaces sgd_minibatch_size in Ray 2.30+
+            # 256 balances gradient noise vs. throughput
+            mini_batch_size_per_learner=256,
             num_sgd_iter=10,
             lr=5e-4,
             lambda_=0.95,
