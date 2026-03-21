@@ -315,6 +315,19 @@ def build_ppo_config(
     # ------------------------------------------------------------------ #
     num_gpus_learner, num_gpus_per_worker = _detect_gpu_resources()
 
+    # ------------------------------------------------------------------ #
+    # Minibatch size: parameter name changed across Ray 2.x versions.
+    # Detect which name the installed version accepts to stay compatible.
+    # ------------------------------------------------------------------ #
+    import inspect as _inspect
+    _ppo_training_params = _inspect.signature(PPOConfig.training).parameters
+    if "mini_batch_size_per_learner" in _ppo_training_params:
+        _minibatch_kwarg: dict = {"mini_batch_size_per_learner": 256}
+    elif "sgd_minibatch_size" in _ppo_training_params:
+        _minibatch_kwarg = {"sgd_minibatch_size": 256}
+    else:
+        _minibatch_kwarg = {}
+
     config = (
         PPOConfig()
         .environment(
@@ -368,9 +381,6 @@ def build_ppo_config(
             # agent-obs).  5 collection rounds × 8 workers = 4,000 env-steps
             # total per batch.  SGD update size unchanged; only collection is fast.
             train_batch_size=4000,
-            # mini_batch_size_per_learner replaces sgd_minibatch_size in Ray 2.30+
-            # 256 balances gradient noise vs. throughput
-            mini_batch_size_per_learner=256,
             num_sgd_iter=10,
             lr=5e-4,
             lambda_=0.95,
@@ -412,6 +422,12 @@ def build_ppo_config(
             policies_to_train=["shared_policy"],
         )
     )
+
+    # Apply minibatch size using the version-appropriate parameter name.
+    # This is done as a second .training() call because **kwargs cannot be
+    # unpacked inside a chained method expression.
+    if _minibatch_kwarg:
+        config = config.training(**_minibatch_kwarg)
 
     return config
 
