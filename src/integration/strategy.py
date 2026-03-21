@@ -69,6 +69,14 @@ _AGGREGATION_CHUNK_SIZE: int = 10
 Keeping this at 10-20 bounds peak memory to ~chunk_size model copies rather
 than materializing all 100 client states simultaneously."""
 
+_HEURISTIC_BLEND_GAMMA: float = 0.3
+"""Blending ratio: final = gamma * ppo_weights + (1-gamma) * heuristic_weights.
+Lower gamma = more heuristic (safer). 0.3 gives PPO 30% influence, heuristic 70%."""
+
+_MAGNITUDE_OUTLIER_THRESHOLD: float = 2.0
+"""Number of MADs (median absolute deviations) above the median magnitude
+beyond which a client's update is considered an outlier and downweighted."""
+
 _MEMORY_WARNING_THRESHOLD: float = 0.80
 """Emit a warning when GPU memory utilisation exceeds this fraction (0-1)."""
 
@@ -134,6 +142,10 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         # Per-round metrics history
         self.round_metrics: Dict[int, Dict[str, Any]] = {}
 
+        # Cross-round EMA weight smoothing to prevent cascading failures
+        # from one bad round polluting the aggregated model.
+        self._ema_weights: Optional[np.ndarray] = None
+
         # Load PPO algorithm --------------------------------------------------
         self.ppo_algo: Optional[Any] = None
         try:
@@ -160,7 +172,22 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
                 ray.shutdown()
             ray.init(ignore_reinit_error=True)
 
-            self.ppo_algo = Algorithm.from_checkpoint(ppo_checkpoint_path)
+            # Override checkpoint config for inference-only mode: disable all
+            # env runners (rollout workers) and GPU allocation for the learner.
+            # from_checkpoint() normally restores the full training topology
+            # (e.g. 8 env runners ~1GB each), but compute_single_action() only
+            # needs the policy network.  This reduces memory by ~8GB.
+            from ray.rllib.utils.checkpoints import get_checkpoint_info
+            checkpoint_info = get_checkpoint_info(ppo_checkpoint_path)
+            state = Algorithm._checkpoint_info_to_algorithm_state(
+                checkpoint_info=checkpoint_info,
+                policy_ids=["shared_policy"],
+            )
+            config = state.get("config")
+            if config is not None:
+                config.num_env_runners = 0
+                config.num_gpus = 0
+            self.ppo_algo = Algorithm.from_state(state)
             # Close RLlib's internal loggers (including TBX) since we only
             # use the algorithm for inference, not training/logging.
             if hasattr(self.ppo_algo, '_result_logger') and self.ppo_algo._result_logger:
@@ -478,8 +505,53 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             magnitudes=magnitudes,
         )
 
-        # -- Step 5: PPO inference → weights -------------------------------
-        weights = self._ppo_inference(state, participating_indices)
+        # -- Step 5: PPO inference + heuristic blending --------------------
+        ppo_weights = self._ppo_inference(state, participating_indices)
+
+        # Warmup: during the first few rounds, early-round features are
+        # unreliable (random model, low gradient SNR).  Use pure heuristic
+        # with linear similarity (no squaring) to avoid amplifying noise.
+        warmup_rounds = 3
+        is_warmup = server_round <= warmup_rounds
+
+        heuristic_weights = self._compute_heuristic_weights(
+            similarities, magnitudes, warmup=is_warmup,
+        )
+
+        # Blend: final = gamma * PPO + (1-gamma) * heuristic
+        # The heuristic provides a robust floor (similar to FLTrust/Median)
+        # while PPO can learn to improve on it over time.
+        # During warmup, gamma=0 (pure heuristic) because PPO is unreliable
+        # on unseen early-round distributions.
+        gamma = 0.0 if is_warmup else _HEURISTIC_BLEND_GAMMA
+        weights = gamma * ppo_weights + (1.0 - gamma) * heuristic_weights
+
+        # Re-normalise after blending (both inputs sum to 1, so blend does too,
+        # but guard against float drift)
+        w_sum = weights.sum()
+        if w_sum > 1e-8:
+            weights = weights / w_sum
+        else:
+            weights = np.full(num_participating, 1.0 / num_participating, dtype=np.float32)
+
+        # Cross-round EMA smoothing: prevents one bad round from causing
+        # cascading failures.  70% historical, 30% new.
+        ema_alpha = 0.3
+        if self._ema_weights is not None and len(self._ema_weights) == len(weights):
+            weights = ema_alpha * weights + (1.0 - ema_alpha) * self._ema_weights
+            weights /= weights.sum()  # re-normalise
+        self._ema_weights = weights.copy()
+
+        logger.info(
+            "Round %d blending: gamma=%.2f, warmup=%s, ema_applied=%s, "
+            "ppo_weight_on_top5_sim=%.4f, heuristic_weight_on_top5_sim=%.4f",
+            server_round,
+            gamma,
+            is_warmup,
+            self._ema_weights is not None,
+            float(ppo_weights[np.argsort(similarities)[-5:]].sum()),
+            float(heuristic_weights[np.argsort(similarities)[-5:]].sum()),
+        )
 
         # -- Step 6: Weighted aggregation ----------------------------------
         aggregated_ndarrays = self._weighted_average(client_params, weights)
@@ -506,6 +578,10 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             "min_weight": float(np.min(weights)),
             "mean_similarity": float(np.mean(similarities)),
             "mean_magnitude": float(np.mean(magnitudes)),
+            "blend_gamma": gamma,
+            "heuristic_entropy": float(-np.sum(
+                heuristic_weights * np.log(heuristic_weights + 1e-10)
+            )),
         }
         self.round_metrics[server_round] = {**metrics}
 
@@ -522,13 +598,89 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         return aggregated_params, metrics
 
     # ------------------------------------------------------------------
+    # Helper: heuristic trust weights (safety net)
+    # ------------------------------------------------------------------
+
+    def _compute_heuristic_weights(
+        self,
+        similarities: np.ndarray,
+        magnitudes: np.ndarray,
+        warmup: bool = False,
+    ) -> np.ndarray:
+        """Compute robust heuristic aggregation weights from server-side features.
+
+        Uses two non-falsifiable signals:
+        1. Gradient similarity to median update (cosine similarity, already [0,1]).
+           Higher similarity = more aligned with the consensus = more trustworthy.
+        2. Magnitude anomaly detection via MAD (median absolute deviation).
+           Clients with update magnitudes far above the median are downweighted
+           as potential poisoners who inject large adversarial gradients.
+
+        The final heuristic weight is: sim_score * magnitude_penalty, normalised.
+
+        During warmup (first few rounds), linear similarity is used instead of
+        squared to avoid amplifying noisy early-round signals when the global
+        model is still random and gradient SNR is very low.
+
+        Args:
+            similarities: Per-client cosine similarity in [0, 1], shape (K,).
+            magnitudes: Per-client L2 norm (min-max normalised to [0,1]), shape (K,).
+            warmup: If True, use linear similarity (gentler) instead of squared.
+
+        Returns:
+            Normalised heuristic weights of shape (K,) summing to 1.
+        """
+        K = len(similarities)
+
+        # --- Similarity-based trust (primary signal) ---
+        # During warmup: linear similarity (gentler, avoids amplifying noise).
+        # After warmup: squared similarity (sharper discrimination).
+        if warmup:
+            sim_trust = np.clip(similarities, 0.0, 1.0)
+        else:
+            sim_trust = np.clip(similarities, 0.0, 1.0) ** 2
+
+        # --- Magnitude anomaly penalty ---
+        # Median Absolute Deviation (MAD) is robust to outliers unlike std.
+        # Clients whose magnitude exceeds median + threshold * MAD are penalised.
+        median_mag = np.median(magnitudes)
+        mad = np.median(np.abs(magnitudes - median_mag))
+        mad = max(mad, 1e-6)  # avoid division by zero for uniform magnitudes
+
+        # z_mag: how many MADs above the median each client is
+        z_mag = (magnitudes - median_mag) / mad
+        # Penalty: 1.0 for normal magnitudes, decays toward 0 for outliers
+        # Using sigmoid-style soft clipping instead of hard threshold
+        mag_penalty = np.where(
+            z_mag > _MAGNITUDE_OUTLIER_THRESHOLD,
+            np.exp(-0.5 * (z_mag - _MAGNITUDE_OUTLIER_THRESHOLD)),
+            1.0,
+        ).astype(np.float32)
+
+        # --- Combined heuristic weight ---
+        heuristic = sim_trust * mag_penalty
+
+        # Normalise to sum to 1
+        h_sum = heuristic.sum()
+        if h_sum < 1e-8:
+            # Extreme fallback: all clients look equally bad
+            return np.full(K, 1.0 / K, dtype=np.float32)
+        return (heuristic / h_sum).astype(np.float32)
+
+    # ------------------------------------------------------------------
     # Helper: gradient similarity
     # ------------------------------------------------------------------
 
     def _compute_gradient_similarity(
         self, client_params: List[List[torch.Tensor]]
     ) -> np.ndarray:
-        """Cosine similarity of each client's flattened update vs. the mean.
+        """Cosine similarity of each client's flattened update vs. the median.
+
+        Uses the coordinate-wise median instead of mean as the reference vector.
+        The median is robust to up to 50% Byzantine clients (we typically have
+        ~30%), whereas the mean can be arbitrarily corrupted by a single
+        large-magnitude adversarial update — especially in early rounds when
+        honest gradients are small and the signal-to-noise ratio is low.
 
         Args:
             client_params: List of per-client parameter tensor lists.
@@ -547,14 +699,16 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             stacked = torch.stack(flat_vectors).to(device, non_blocking=True)  # (N, D)
             self._check_gpu_memory(context="similarity stacked")
-            mean_vec = stacked.mean(dim=0, keepdim=True)  # (1, D)
+            # Median is robust to up to 50% corruption; mean is not.
+            # torch.median returns (values, indices) — we only need values.
+            median_vec = stacked.median(dim=0).values.unsqueeze(0)  # (1, D)
 
             # Cosine similarity (result in [-1, 1], rescale to [0, 1])
-            cos_sim = F.cosine_similarity(stacked, mean_vec, dim=1)  # (N,)
+            cos_sim = F.cosine_similarity(stacked, median_vec, dim=1)  # (N,)
             rescaled = ((cos_sim + 1.0) / 2.0).cpu().numpy().astype(np.float32)
 
             # Free the large stacked matrix immediately after use
-            del stacked, mean_vec, cos_sim
+            del stacked, median_vec, cos_sim
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -672,11 +826,39 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         if self.ppo_algo is not None:
             try:
                 raw_weights = np.zeros(K, dtype=np.float32)
+
+                # Detect LSTM vs MLP checkpoint by querying the initial state.
+                # get_initial_state() returns a non-empty list for LSTM policies
+                # and an empty list for plain MLP policies.
+                policy = self.ppo_algo.get_policy("shared_policy")
+                initial_state = policy.model.get_initial_state()
+                use_lstm = len(initial_state) > 0
+
+                if use_lstm:
+                    # Zero-initialise the LSTM hidden state for this round.
+                    # State is reset between FL rounds (on-chain EMA already
+                    # encodes cross-round history); within a round the hidden
+                    # state is threaded sequentially across the per-client loop
+                    # so the LSTM attends to the full participating cohort.
+                    lstm_state: List[np.ndarray] = [
+                        np.zeros_like(s) for s in initial_state
+                    ]
+
                 for i in range(K):
                     obs_i = state[i]  # shape (NUM_FEATURES,) = (9,)
-                    action = self.ppo_algo.compute_single_action(
-                        obs_i, policy_id="shared_policy"
-                    )
+                    if use_lstm:
+                        # compute_single_action with state returns a 3-tuple:
+                        # (action, state_out, info).  state_out is threaded to
+                        # the next iteration so seq_lens is correctly populated.
+                        action, lstm_state, _ = self.ppo_algo.compute_single_action(
+                            obs_i,
+                            state=lstm_state,
+                            policy_id="shared_policy",
+                        )
+                    else:
+                        action = self.ppo_algo.compute_single_action(
+                            obs_i, policy_id="shared_policy"
+                        )
                     raw_weights[i] = float(np.clip(action[0], 0.0, 1.0))
 
                 # Normalise to sum to 1

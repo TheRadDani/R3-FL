@@ -90,20 +90,31 @@ _REPUTATION_EMA_BETA: float = 1.0 - _REPUTATION_EMA_ALPHA
 class FLReputationEnv(MultiAgentEnv):
     """Multi-agent environment simulating an FL aggregation round (MAPPO).
 
-    Each of the NUM_CLIENTS FL clients is modeled as an independent RL agent.
+    Each of the num_clients FL clients is modeled as an independent RL agent.
     All agents share the same policy network (parameter sharing). Each agent
-    observes its own 5-feature behavioral vector and outputs a single scalar
+    observes its own 9-feature behavioral vector and outputs a single scalar
     aggregation weight. The reward is cooperative: every agent receives the
     same global reward signal.
 
     Reward:
-        R = alpha * weighted_accuracy - beta * attack_impact
+        R = alpha * weighted_accuracy
+          - beta * attack_impact
+          - delta * low_sim_penalty
+          + zeta * consistency_bonus
 
     Args:
         alpha: Weight for the accuracy term in the reward (default 0.6).
         beta: Weight for the attack-impact penalty in the reward (default 0.4).
+        delta: Penalty for assigning weight to clients with low gradient_similarity
+            (default 0.3). This uses server-computed features that cannot be falsified.
+        zeta: Bonus for weight-similarity correlation (default 0.2). Rewards the
+            agent when its weights align with gradient similarity scores.
         malicious_fraction: Proportion of clients that are malicious (default 0.3).
         max_rounds: Maximum FL rounds per episode (default 200).
+        num_clients: Number of FL clients in the federation (default NUM_CLIENTS=100).
+            Can be overridden via ``env_config["num_clients"]`` in RLlib to run
+            benchmarks or evaluations with a different client count.
+        render_mode: Optional rendering mode; ``"human"`` prints a round summary.
     """
 
     metadata: dict[str, Any] = {"render_modes": ["human"], "render_fps": 1}
@@ -116,8 +127,11 @@ class FLReputationEnv(MultiAgentEnv):
         self,
         alpha: float = 0.6,
         beta: float = 0.4,
+        delta: float = 0.3,
+        zeta: float = 0.2,
         malicious_fraction: float = 0.3,
         max_rounds: int = 200,
+        num_clients: int = NUM_CLIENTS,
         render_mode: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -125,19 +139,25 @@ class FLReputationEnv(MultiAgentEnv):
         # Reward hyper-parameters
         self.alpha = np.float32(alpha)   # cast once at init — avoids silent float64 promotion
         self.beta = np.float32(beta)
+        self.delta = np.float32(delta)   # low-similarity penalty coefficient
+        self.zeta = np.float32(zeta)     # consistency bonus coefficient
 
         # Episode configuration
         self.malicious_fraction = malicious_fraction
         self.max_rounds = max_rounds
         self.render_mode = render_mode
 
+        # Configurable client count — stored before any buffer allocation that
+        # depends on it.  The module-level NUM_CLIENTS constant is preserved for
+        # backward-compatible imports (e.g. strategy.py).
+        self.num_clients: int = num_clients
+
         # Agent IDs — required by MultiAgentEnv
-        self._agent_ids = {f"agent_{i}" for i in range(NUM_CLIENTS)}
+        self._agent_ids = {f"agent_{i}" for i in range(self.num_clients)}
 
         # Pre-computed ordered agent ID list — avoids f-string formatting on every
-        # step() call.  100 agents × many iterations = meaningful savings in CPython.
-        # Use this list (not the set above) wherever iteration order matters.
-        self._agent_id_list: list[str] = [f"agent_{i}" for i in range(NUM_CLIENTS)]
+        # step() call.  Use this list (not the set above) wherever iteration order matters.
+        self._agent_id_list: list[str] = [f"agent_{i}" for i in range(self.num_clients)]
 
         # Per-agent spaces — each agent sees its own feature vector and
         # outputs a single scalar weight. Explicit float32 dtype avoids
@@ -162,44 +182,36 @@ class FLReputationEnv(MultiAgentEnv):
 
         # Main state matrix — written in-place by _generate_state()
         self._state: np.ndarray = np.zeros(
-            (NUM_CLIENTS, NUM_FEATURES), dtype=np.float32
+            (self.num_clients, NUM_FEATURES), dtype=np.float32
         )
 
         # Reusable weight normalization buffer — avoids allocation in _compute_reward
-        self._p_buffer: np.ndarray = np.zeros(NUM_CLIENTS, dtype=np.float32)
-
-        # Reusable log-probability buffer for entropy computation
-        self._logp_buffer: np.ndarray = np.zeros(NUM_CLIENTS, dtype=np.float32)
+        # and _update_reputation (written in-place for EMA updates)
+        self._p_buffer: np.ndarray = np.zeros(self.num_clients, dtype=np.float32)
 
         # Pre-allocated honest/malicious signal buffers — sized to max possible;
         # actual slice depends on malicious_fraction set each episode
-        self._honest_signal: np.ndarray = np.zeros(NUM_CLIENTS, dtype=np.float32)
-        self._malicious_signal: np.ndarray = np.zeros(NUM_CLIENTS, dtype=np.float32)
+        self._honest_signal: np.ndarray = np.zeros(self.num_clients, dtype=np.float32)
+        self._malicious_signal: np.ndarray = np.zeros(self.num_clients, dtype=np.float32)
 
         # Internal state (set properly in reset())
         self._rng: np.random.Generator = np.random.default_rng()
-        self._malicious_mask: np.ndarray = np.zeros(NUM_CLIENTS, dtype=bool)
-        self._honest_mask: np.ndarray = np.ones(NUM_CLIENTS, dtype=bool)  # ~_malicious_mask
+        self._malicious_mask: np.ndarray = np.zeros(self.num_clients, dtype=bool)
+        self._honest_mask: np.ndarray = np.ones(self.num_clients, dtype=bool)  # ~_malicious_mask
         self._round: int = 0
         self._prev_weights: np.ndarray = np.full(
-            NUM_CLIENTS, 1.0 / NUM_CLIENTS, dtype=np.float32
+            self.num_clients, 1.0 / self.num_clients, dtype=np.float32
         )
         self._cumulative_reward: float = 0.0
 
         # ------------------------------------------------------------------ #
         # Pre-computed static reward-shaping coefficients
-        # Compute once at __init__ — avoids repeated log/division in hot path
+        # Compute once at __init__ — avoids repeated operations in hot path
         # ------------------------------------------------------------------ #
 
-        # log(NUM_CLIENTS) — denominator for entropy normalization
-        # Stored as float32 to match all other reward computations
-        self._log_num_clients: np.float32 = np.float32(np.log(NUM_CLIENTS))
-
-        # Small entropy penalty coefficient — gentle guidance, not domination
-        self._entropy_coeff: np.float32 = np.float32(0.05)
-
-        # Epsilon for log(0) guard in entropy computation
-        self._log_eps: np.float32 = np.float32(1e-10)
+        # Normalization penalty coefficient — penalises raw action sums far from 1.0
+        # to resolve the scale ambiguity introduced by weight_sum normalisation.
+        self._norm_penalty_lambda: np.float32 = np.float32(0.01)
 
         # Epsilon for weight-sum guard (avoids div-by-zero when all weights≈0)
         self._wsum_eps: np.float32 = np.float32(1e-8)
@@ -227,10 +239,16 @@ class FLReputationEnv(MultiAgentEnv):
         # Manage RNG directly (MultiAgentEnv doesn't use gymnasium's seed protocol)
         self._rng = np.random.default_rng(seed)
 
-        # Randomly designate malicious clients for this episode
-        num_malicious = int(NUM_CLIENTS * self.malicious_fraction)
+        # Vary the malicious fraction slightly each episode to improve
+        # generalization across different attack intensities (+-10%).
+        effective_fraction = np.clip(
+            self.malicious_fraction + self._rng.uniform(-0.1, 0.1),
+            0.05,  # at least 1 malicious client
+            0.5,   # at most half
+        )
+        num_malicious = max(1, int(self.num_clients * effective_fraction))
         malicious_indices = self._rng.choice(
-            NUM_CLIENTS, size=num_malicious, replace=False
+            self.num_clients, size=num_malicious, replace=False
         )
         # Re-use existing mask buffers — fill(False) then set indices True
         self._malicious_mask[:] = False
@@ -242,7 +260,7 @@ class FLReputationEnv(MultiAgentEnv):
         self._round = 0
         self._cumulative_reward = 0.0
         # In-place fill avoids allocation of new full() array
-        self._prev_weights.fill(1.0 / NUM_CLIENTS)
+        self._prev_weights.fill(1.0 / self.num_clients)
 
         # Generate the first observation (writes into self._state in-place)
         self._generate_state(initial=True)
@@ -352,7 +370,7 @@ class FLReputationEnv(MultiAgentEnv):
         print(f"  Top-5 weighted    : {top_5.tolist()}")
         print(f"  Bottom-5 weighted : {bottom_5.tolist()}")
         print(
-            f"  Malicious clients : {int(self._malicious_mask.sum())} / {NUM_CLIENTS}"
+            f"  Malicious clients : {int(self._malicious_mask.sum())} / {self.num_clients}"
         )
 
     # --------------------------------------------------------------------- #
@@ -367,6 +385,10 @@ class FLReputationEnv(MultiAgentEnv):
         Writes directly into the pre-allocated self._state buffer — no return value,
         no allocation.
 
+        Feature distributions decay exponentially with round progress t ∈ [0, 1]
+        so the training distribution covers the full FL convergence trajectory
+        (aggressive decay for _LOSS/_MAG; gentle decay for _ACC; _SIM unchanged).
+
         Args:
             initial: If True, set reputation column to 0.5 for all clients.
                      If False, carry forward the updated reputation column.
@@ -375,6 +397,13 @@ class FLReputationEnv(MultiAgentEnv):
         malicious_mask = self._malicious_mask
         n_honest = int(honest_mask.sum())
         n_malicious = int(malicious_mask.sum())
+
+        # Convergence progress t ∈ [0, 1] over the episode.
+        # At t=0 (round 0) decay=1 → original distributions.
+        # At t=1 (final round) decay→e^{-2}≈0.135, decay_soft→e^{-0.8}≈0.449.
+        t          = np.float32(self._round / self.max_rounds)
+        decay      = np.float32(np.exp(-2.0 * t))   # aggressive: _LOSS, _MAG
+        decay_soft = np.float32(np.exp(-0.8 * t))   # gentle:     _ACC
 
         # Save reputation column before zeroing the whole buffer.
         # _update_reputation() writes directly into self._state[:, _REP]
@@ -387,17 +416,45 @@ class FLReputationEnv(MultiAgentEnv):
         # Zero the entire state buffer in-place — one fast memset
         self._state.fill(0.0)
 
-        # --- Honest clients (vectorized column writes) ---
-        self._state[honest_mask, _ACC] = self._rng.normal(0.7, 0.10, size=n_honest)
-        self._state[honest_mask, _SIM] = self._rng.normal(0.8, 0.10, size=n_honest)
-        self._state[honest_mask, _LOSS] = self._rng.normal(0.6, 0.15, size=n_honest)
-        self._state[honest_mask, _MAG] = self._rng.normal(0.5, 0.10, size=n_honest)
+        # --- Honest clients — distributions decay as FL model converges ---
+        self._state[honest_mask, _ACC]  = self._rng.normal(
+            np.float32(0.7) * decay_soft,
+            max(np.float32(0.04), np.float32(0.10) * decay_soft),
+            size=n_honest,
+        )
+        # _SIM unchanged — gradient similarity stays high throughout convergence
+        self._state[honest_mask, _SIM]  = self._rng.normal(0.8, 0.10, size=n_honest)
+        self._state[honest_mask, _LOSS] = self._rng.normal(
+            np.float32(0.6) * decay,
+            max(np.float32(0.04), np.float32(0.15) * decay),
+            size=n_honest,
+        )
+        self._state[honest_mask, _MAG]  = self._rng.normal(
+            np.float32(0.5) * decay,
+            max(np.float32(0.03), np.float32(0.10) * decay),
+            size=n_honest,
+        )
 
-        # --- Malicious clients (vectorized column writes) ---
-        self._state[malicious_mask, _ACC] = self._rng.normal(0.3, 0.15, size=n_malicious)
-        self._state[malicious_mask, _SIM] = self._rng.normal(0.2, 0.15, size=n_malicious)
-        self._state[malicious_mask, _LOSS] = self._rng.normal(0.2, 0.10, size=n_malicious)
-        self._state[malicious_mask, _MAG] = self._rng.normal(0.9, 0.20, size=n_malicious)
+        # --- Malicious clients — _LOSS/_ACC decay relatively; _MAG stays elevated ---
+        # (attacker injects large poisoned gradients even at convergence,
+        #  keeping _MAG distinguishable from the decayed honest signal)
+        self._state[malicious_mask, _ACC]  = self._rng.normal(
+            np.float32(0.3) * decay_soft,
+            max(np.float32(0.05), np.float32(0.15) * decay_soft),
+            size=n_malicious,
+        )
+        self._state[malicious_mask, _SIM]  = self._rng.normal(0.2, 0.15, size=n_malicious)
+        self._state[malicious_mask, _LOSS] = self._rng.normal(
+            np.float32(0.2) * decay,
+            max(np.float32(0.04), np.float32(0.10) * decay),
+            size=n_malicious,
+        )
+        # Attacker _MAG: linear mild decay (0.90 → 0.75) so detection signal persists
+        self._state[malicious_mask, _MAG]  = self._rng.normal(
+            np.float32(0.9) - np.float32(0.15) * t,
+            np.float32(0.20),
+            size=n_malicious,
+        )
 
         # --- Reputation column ---
         if initial:
@@ -432,13 +489,19 @@ class FLReputationEnv(MultiAgentEnv):
     ) -> tuple[float, dict[str, Any]]:
         """Compute the scalar reward for a given weight vector.
 
-        Reward = alpha * weighted_accuracy - beta * attack_impact - entropy_penalty
+        Reward = alpha * weighted_accuracy
+               - beta * attack_impact
+               - delta * low_sim_penalty
+               + zeta * consistency_bonus
+               - lambda * |weight_sum - 1|
+
+        The low_sim_penalty and consistency_bonus use gradient_similarity (_SIM),
+        which is a server-computed feature that cannot be falsified by clients.
+        This makes the reward more robust than relying solely on client-reported
+        accuracy_contribution.
 
         All operations are vectorized numpy; no Python loops in the hot path.
-        Pre-allocated buffers (_p_buffer, _logp_buffer) avoid per-call allocation.
-
-        A small entropy-based penalty is added when weights are nearly uniform,
-        which would indicate the agent is not discriminating between clients.
+        Pre-allocated buffers (_p_buffer) avoid per-call allocation.
 
         Args:
             weights: Per-client aggregation weights in [0, 1].
@@ -453,7 +516,9 @@ class FLReputationEnv(MultiAgentEnv):
             return -1.0, {
                 "weighted_accuracy": 0.0,
                 "attack_impact": 1.0,
-                "entropy_penalty": 0.0,
+                "low_sim_penalty": 1.0,
+                "consistency_bonus": 0.0,
+                "norm_penalty": float(self._norm_penalty_lambda),
                 "reward": -1.0,
             }
 
@@ -465,41 +530,54 @@ class FLReputationEnv(MultiAgentEnv):
         weighted_accuracy = float(np.dot(weights, acc_contributions) * inv_weight_sum)
 
         # Attack impact: fraction of total weight allocated to malicious clients
-        # np.dot with boolean mask is equivalent to np.sum(weights[mask])
         malicious_weight = float(np.sum(weights[self._malicious_mask]))
         attack_impact = malicious_weight * inv_weight_sum
 
-        # Entropy penalty — reuse pre-allocated buffers to avoid per-call alloc
-        # p = weights / weight_sum  (written into _p_buffer in-place)
-        np.multiply(weights, inv_weight_sum, out=self._p_buffer)
-
-        # log(p + epsilon)  (written into _logp_buffer in-place)
-        np.add(self._p_buffer, self._log_eps, out=self._logp_buffer)
-        np.log(self._logp_buffer, out=self._logp_buffer)
-
-        # entropy = -sum(p * log_p)  (dot product, scalar result)
-        entropy = float(-np.dot(self._p_buffer, self._logp_buffer))
-
-        # Normalise entropy by log(NUM_CLIENTS) — pre-computed at init time
-        normalised_entropy = (
-            entropy / float(self._log_num_clients)
-            if self._log_num_clients > 0
-            else 0.0
+        # --- Low-similarity penalty (server-computed, non-falsifiable) ---
+        # Penalise giving weight to clients with low gradient similarity.
+        # Gradient similarity is the strongest server-side signal for detecting
+        # poisoned updates — it cannot be faked by the client.
+        similarities = self._state[:, _SIM]  # view, no copy
+        # Weighted mean of (1 - similarity): high penalty when weight goes to
+        # low-similarity clients
+        low_sim_penalty = float(
+            np.dot(weights, 1.0 - similarities) * inv_weight_sum
         )
 
-        # Small entropy penalty — gentle guidance toward weight discrimination
-        entropy_penalty = float(self._entropy_coeff * normalised_entropy)
+        # --- Consistency bonus (reward alignment with similarity) ---
+        # Pearson correlation between normalised weights and similarity scores.
+        # Reward is positive when weights track similarity (agent trusts
+        # high-similarity clients more). Range: [-1, 1], clipped to [0, 1].
+        norm_weights = weights * inv_weight_sum
+        w_mean = norm_weights.mean()
+        s_mean = similarities.mean()
+        w_centered = norm_weights - w_mean
+        s_centered = similarities - s_mean
+        cov = float(np.dot(w_centered, s_centered))
+        w_std = float(np.sqrt(np.dot(w_centered, w_centered)))
+        s_std = float(np.sqrt(np.dot(s_centered, s_centered)))
+        if w_std > 1e-8 and s_std > 1e-8:
+            consistency_bonus = max(0.0, cov / (w_std * s_std))
+        else:
+            consistency_bonus = 0.0
+
+        # Normalization penalty — penalises raw weight sums far from 1.0.
+        norm_penalty = float(self._norm_penalty_lambda * abs(weight_sum - 1.0))
 
         reward = float(
             self.alpha * weighted_accuracy
             - self.beta * attack_impact
-            - entropy_penalty
+            - self.delta * low_sim_penalty
+            + self.zeta * consistency_bonus
+            - norm_penalty
         )
 
         info: dict[str, Any] = {
             "weighted_accuracy": weighted_accuracy,
             "attack_impact": float(attack_impact),
-            "entropy_penalty": entropy_penalty,
+            "low_sim_penalty": low_sim_penalty,
+            "consistency_bonus": consistency_bonus,
+            "norm_penalty": norm_penalty,
             "reward": reward,
         }
         return reward, info
