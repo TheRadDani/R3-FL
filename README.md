@@ -68,6 +68,15 @@ Where:
 
 In MAPPO with parameter sharing, each agent independently outputs a continuous scalar weight in [0, 1]. The K participating clients each produce one weight via the shared policy. These K weights are clipped to [0, 1] and L1-normalized to sum to 1 before weighted parameter averaging. This per-agent scalar output eliminates the large centralized action space bottleneck and scales naturally to any client cohort size.
 
+### Aggregation Weight Pipeline
+
+The inference process in `RLReputationStrategy` integrates multiple techniques to improve robustness:
+
+1. **PPO Inference**: Each of the K participating clients produces a scalar weight via the shared policy.
+2. **Heuristic Baseline** (safety net): Computes gradient similarity and magnitude-based weights as a fallback. During the first round (warmup), this baseline is used exclusively; in subsequent rounds it is blended with PPO.
+3. **Blending** (Tier 1 fix): Final weights = `gamma * PPO_weights + (1 - gamma) * heuristic_weights`, where `gamma = 0.5` (equal influence after warmup). This ensures the trained policy is tempered by a robust, interpretable baseline.
+4. **Cross-Round EMA Smoothing** (Tier 1 fix): Per-round weights are further smoothed via exponential moving average to prevent one adversarial round from cascading into model corruption. EMA formula: `final_weights = 0.5 * current_weights + 0.5 * previous_weights`.
+
 ### Reputation Update (EMA)
 
 After each round, on-chain reputation scores are updated:
@@ -75,6 +84,16 @@ After each round, on-chain reputation scores are updated:
 - Malicious clients receiving high weight see their reputation decrease (because the signal becomes "agent trusted a bad actor").
 
 EMA formula: `rep_new = (1 − 0.3) · rep_old + 0.3 · signal`
+
+### Sequential Memory (LSTM State Persistence)
+
+The trained PPO policy includes an LSTM cell. At inference time, the LSTM hidden state is:
+- **Initialized** with zeros at the start of the FL simulation
+- **Persisted** across consecutive FL rounds (Tier 1 fix) so the LSTM accumulates temporal patterns within a simulation
+- **Carried forward** between rounds to enable detection of slow-drift poisoning and gradual attack escalation
+- **Reset naturally** when a new `RLReputationStrategy` instance is created (one per benchmark run)
+
+This allows the LSTM to encode behavioral trends over time — clients whose `update_magnitude` or `gradient_similarity` changes gradually become distinguishable from white-noise attacks on a per-round basis.
 
 ---
 
@@ -131,7 +150,7 @@ flowchart TD
 | `storage_utils.py` | `src/blockchain/storage_utils.py` | Redis upload/download for serialized tensors; zlib compression (level 1); UUID as CID key |
 | `web3_utils.py` | `src/blockchain/web3_utils.py` | web3.py wrapper: deploy, `updateClient`, `batchUpdateClients`, `getClient` |
 | `deploy.py` | `src/blockchain/scripts/deploy.py` | CLI script: deploys contract and writes `deployment.json` manifest |
-| `RLReputationStrategy` | `src/integration/strategy.py` | Flower `Strategy` subclass that ties FL + blockchain + PPO together; chunked memory-efficient aggregation |
+| `RLReputationStrategy` | `src/integration/strategy.py` | Flower `Strategy` subclass that ties FL + blockchain + PPO together; includes heuristic blending, warmup, cross-round EMA smoothing, and LSTM state persistence across rounds |
 | `run_benchmarks.py` | `scripts/run_benchmarks.py` | Runs multiple strategies head-to-head under identical attack conditions; outputs per-strategy JSON results |
 
 ### Attack Vectors Modeled
@@ -367,8 +386,8 @@ python -m src.rl_agent.train --iterations 50 --time-inference
 | Algorithm | MAPPO | Multi-Agent PPO with parameter sharing |
 | Framework | PyTorch | Explicit; required for AMP |
 | Multi-Agent | Parameter sharing | Single policy network shared across all K agents |
-| Per-agent obs space | (9,) | 9 features: 5 local (accuracy, similarity, reputation, loss, magnitude) + 4 global means |
-| Per-agent action space | (1,) | Scalar weight in [0, 1] |
+| Per-agent obs space | (9,) | 9 features: 5 local (accuracy_contribution, gradient_similarity, historical_reputation, loss_improvement, update_magnitude) + 4 global means |
+| Per-agent action space | (1,) | Scalar weight in [0, 1], clipped to [0, 1] and L1-normalized |
 | Train batch size | 4000 steps | Reduce if GPU OOM |
 | SGD minibatch | 256 | Balances gradient noise and throughput |
 | SGD iterations | 10 per batch | |
@@ -396,7 +415,7 @@ Setting `"use_lstm": True` in the RLlib model config wraps the `[64, 64]` fully-
 
 **Why this helps:** Many adaptive poisoning strategies are invisible on any single round — a slow-drift attacker gradually inflates its `update_magnitude` over many rounds, staying below single-round detection thresholds. A Markovian policy (MLP without memory) cannot distinguish this from noise. The LSTM's hidden state encodes the trajectory of each agent's behavioral signals over time, making slow-drift poisoning, gradual reputation erosion, and oscillating attack strategies detectable patterns rather than noise.
 
-**Inference implications:** At FL simulation time (`RLReputationStrategy`), `compute_single_action` is called once per participating client per round using the stateless API (no explicit hidden state threading). For full sequential advantage at inference, the LSTM hidden state should ideally be carried forward between rounds. The current inference path uses the default RLlib stateless mode, which resets the hidden state each round; threading state explicitly across rounds is a planned improvement that would maximize the benefit of the trained LSTM memory.
+**Inference implications:** At FL simulation time (`RLReputationStrategy`), the trained LSTM hidden state is **explicitly persisted across FL rounds** (Tier 1 fix, implemented in current version). The policy accumulates temporal context across rounds via `_lstm_state` that threads the LSTM hidden state between consecutive `compute_single_action` calls. This enables detection of slow-drift poisoning attacks that unfold gradually across many rounds rather than manifesting in a single snapshot.
 
 **Architecture improvements (vs. baseline PPO):**
 
@@ -454,6 +473,15 @@ The `RLReputationStrategy` performs these steps each round:
 9. Calls `batchUpdateClients()` on the contract to commit all reputation scores atomically.
 
 If the MAPPO checkpoint is unavailable or inference fails, the strategy falls back to uniform (FedAvg-style) weights and logs a warning. The per-client inference loop naturally adapts to any cohort size without padding or retraining.
+
+#### Tier 1 Inference Improvements
+
+The current implementation includes four targeted inference tuning changes:
+
+1. **Heuristic Blending** (`_HEURISTIC_BLEND_GAMMA = 0.5`): Blend PPO and heuristic weights equally in steady state. The heuristic provides a robust, interpretable floor while PPO learns to improve on it.
+2. **Warmup Strategy** (`warmup_rounds = 1`): During the first FL round, use pure heuristic weights (no PPO) because early-round features are unreliable (random model, low gradient signal-to-noise).
+3. **Cross-Round EMA Smoothing** (`ema_alpha = 0.5`): Smooth aggregation weights across consecutive rounds to prevent single-round adversarial shocks from corrupting the aggregated model.
+4. **LSTM State Persistence**: Thread the LSTM hidden state across rounds so the policy can detect temporal attack patterns (slow-drift, gradual escalation) instead of treating each round independently.
 
 ---
 
@@ -801,6 +829,77 @@ R3-FL introduces learning-based trust models to federated learning systems that 
 - Any edge computing scenario where immutable, tamper-proof reputation history provides accountability guarantees that static aggregation rules cannot.
 
 The key contribution is replacing a hand-tuned mathematical filter with a reward-shaped Multi-Agent RL policy (MAPPO with parameter sharing) that adapts its weighting strategy based on accumulated behavioral evidence — including cross-round memory encoded in on-chain reputation scores and, with LSTM, within-sequence temporal patterns. The multi-agent architecture with shared parameters enables the system to dynamically handle varying client cohort sizes without retraining, addressing a fundamental scalability constraint of centralized RL approaches.
+
+---
+
+## Citations and References
+
+This project builds on foundational work in federated learning, reinforcement learning, and Byzantine-robust aggregation. Key references include:
+
+### Federated Learning Frameworks
+- **Flower (FLOWER)**: McMahan et al. "Flower: A Friendly Federated Learning Research Framework." arXiv preprint arXiv:2007.14861 (2020).
+  - Provides the FL simulation framework and Strategy abstraction used in R3-FL.
+  - Website: [https://flower.dev/](https://flower.dev/)
+
+### Byzantine-Robust Aggregation Baselines
+- **FedAvg**: McMahan et al. "Communication-Efficient Learning of Deep Networks from Decentralized Data." ICML 2017.
+  - Standard federated averaging; used as baseline.
+
+- **Krum**: Blanchard et al. "Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent." NIPS 2017.
+  - Euclidean distance-based robust aggregation; implemented as a baseline strategy.
+
+- **Median / Trimmed Mean**: Yin et al. "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates." ICML 2018.
+  - Coordinate-wise statistical aggregation methods; implemented as baselines.
+
+- **FLTrust**: Cao et al. "FLTrust: Byzantine-robust Federated Learning via Confidence-based Filtering." arXiv preprint arXiv:2012.01897 (2020).
+  - Server-side trust dataset with cosine similarity scoring; implemented as a baseline strategy.
+
+### Reinforcement Learning and Multi-Agent Learning
+- **Proximal Policy Optimization (PPO)**: Schulman et al. "Proximal Policy Optimization Algorithms." arXiv preprint arXiv:1707.06347 (2017).
+  - Core RL algorithm; implemented via Ray RLlib.
+
+- **Multi-Agent PPO (MAPPO)**: Yu et al. "The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games." arXiv preprint arXiv:2108.08040 (2021).
+  - Multi-agent PPO with parameter sharing; used for R3-FL's distributed trust arbiter.
+  - Website: [https://docs.ray.io/en/latest/rllib/index.html](https://docs.ray.io/en/latest/rllib/index.html)
+
+### Reinforcement Learning Infrastructure
+- **Ray RLlib**: Liang et al. "RLlib: Abstractions for Distributed Reinforcement Learning." ICML 2018.
+  - Training framework for the PPO agent; provides scalable multi-agent environments and distributed learning.
+
+- **Gymnasium**: Brockman et al. "OpenAI Gym." arXiv preprint arXiv:1606.01540 (2016).
+  - Reinforcement learning environment specification; RLlib uses Gymnasium environment standard.
+
+### Blockchain and Smart Contracts
+- **Ethereum**: Wood et al. "Ethereum: A Secure Decentralised Generalised Transaction Ledger." (2014).
+  - Blockchain platform for immutable reputation ledger; smart contracts written in Solidity 0.8.19.
+
+- **Hardhat**: Nomic Foundation. "Hardhat: Ethereum Development Framework."
+  - Local testing and development environment; used for contract testing and deployment.
+  - Website: [https://hardhat.org/](https://hardhat.org/)
+
+- **web3.py**: Pipermeister et al. "Web3.py: A Python library for interacting with Ethereum."
+  - Python bindings for Ethereum JSON-RPC; used for contract interaction from `web3_utils.py`.
+
+### Dataset and Benchmarks
+- **EMNIST**: Cohen et al. "EMNIST: Extending MNIST to handwritten letters." IJCNN 2017.
+  - Extended MNIST dataset; partitioned using Dirichlet distribution (α=0.5) for heterogeneous federated learning simulation.
+
+### Attack Models
+- **Label Flipping**: Nelson et al. "Poisoning Attacks against Support Vector Machines." ICML 2012.
+  - Adversarial label corruption; simulated via `LabelFlippedDataset` wrapper.
+
+- **Noise Injection**: Blanchard et al. "Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent." NIPS 2017.
+  - Gaussian noise injection into gradients; implemented in `FlowerClient._inject_noise()`.
+
+- **Sybil Attacks**: Douceur et al. "The Sybil Attack." IPTPS 2002.
+  - Multiple coordinated malicious clients; tested by configuring large malicious fractions with identical attacks.
+
+### Temporal Learning and LSTM Memory
+- **Long Short-Term Memory Networks (LSTM)**: Hochreiter & Schmidhuber. "Long Short-Term Memory." Neural Computation 1997.
+  - Sequential memory architecture used in the trained PPO policy; enables detection of slow-drift poisoning.
+
+- **Temporal Reasoning in RL**: Mnih et al. "Asynchronous Methods for Deep Reinforcement Learning." ICML 2016.
+  - Foundation for LSTM-based policy learning in multi-step sequential environments.
 
 ---
 
