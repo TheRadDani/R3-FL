@@ -97,20 +97,30 @@ class FLReputationEnv(MultiAgentEnv):
     same global reward signal.
 
     Reward:
-        R = alpha * weighted_accuracy
-          - beta * attack_impact
+        R = alpha * weighted_similarity
+          - beta * malicious_weight_penalty
           - delta * low_sim_penalty
-          + zeta * consistency_bonus
+          + eta * improvement_bonus
+          - norm_penalty
+
+    The reward uses gradient_similarity (server-computed, non-falsifiable) instead
+    of accuracy_contribution (client-reported, falsifiable) as the primary quality
+    signal. An improvement bonus replaces the old consistency bonus (Pearson
+    correlation) which rewarded conformity with the heuristic rather than actual
+    improvement.
 
     Args:
-        alpha: Weight for the accuracy term in the reward (default 0.6).
-        beta: Weight for the attack-impact penalty in the reward (default 0.4).
+        alpha: Weight for the similarity term in the reward (default 0.5).
+        beta: Weight for the malicious-weight penalty in the reward (default 0.3).
         delta: Penalty for assigning weight to clients with low gradient_similarity
             (default 0.3). This uses server-computed features that cannot be falsified.
-        zeta: Bonus for weight-similarity correlation (default 0.2). Rewards the
-            agent when its weights align with gradient similarity scores.
+        eta: Coefficient for improvement bonus — rewards round-over-round
+            improvement in weighted similarity (default 0.3).
         malicious_fraction: Proportion of clients that are malicious (default 0.3).
         max_rounds: Maximum FL rounds per episode (default 200).
+        min_rounds: Minimum FL rounds per episode for short-episode training
+            (default 5). Each episode samples a random length in
+            [min_rounds, max_rounds].
         num_clients: Number of FL clients in the federation (default NUM_CLIENTS=100).
             Can be overridden via ``env_config["num_clients"]`` in RLlib to run
             benchmarks or evaluations with a different client count.
@@ -125,12 +135,13 @@ class FLReputationEnv(MultiAgentEnv):
 
     def __init__(
         self,
-        alpha: float = 0.6,
-        beta: float = 0.4,
+        alpha: float = 0.5,
+        beta: float = 0.3,
         delta: float = 0.3,
-        zeta: float = 0.2,
+        eta: float = 0.3,
         malicious_fraction: float = 0.3,
         max_rounds: int = 200,
+        min_rounds: int = 5,
         num_clients: int = NUM_CLIENTS,
         render_mode: Optional[str] = None,
     ) -> None:
@@ -140,11 +151,12 @@ class FLReputationEnv(MultiAgentEnv):
         self.alpha = np.float32(alpha)   # cast once at init — avoids silent float64 promotion
         self.beta = np.float32(beta)
         self.delta = np.float32(delta)   # low-similarity penalty coefficient
-        self.zeta = np.float32(zeta)     # consistency bonus coefficient
+        self.eta = np.float32(eta)       # improvement bonus coefficient
 
         # Episode configuration
         self.malicious_fraction = malicious_fraction
         self.max_rounds = max_rounds
+        self.min_rounds = min_rounds
         self.render_mode = render_mode
 
         # Configurable client count — stored before any buffer allocation that
@@ -203,6 +215,8 @@ class FLReputationEnv(MultiAgentEnv):
             self.num_clients, 1.0 / self.num_clients, dtype=np.float32
         )
         self._cumulative_reward: float = 0.0
+        self._prev_weighted_sim: float = 0.0  # tracks previous round's weighted similarity
+        self._episode_max_rounds: int = max_rounds  # randomized per episode in reset()
 
         # ------------------------------------------------------------------ #
         # Pre-computed static reward-shaping coefficients
@@ -259,6 +273,11 @@ class FLReputationEnv(MultiAgentEnv):
         # Reset episode counters
         self._round = 0
         self._cumulative_reward = 0.0
+        self._prev_weighted_sim = 0.0
+        # Short-episode training: sample a random episode length each reset
+        self._episode_max_rounds = int(
+            self._rng.integers(self.min_rounds, self.max_rounds + 1)
+        )
         # In-place fill avoids allocation of new full() array
         self._prev_weights.fill(1.0 / self.num_clients)
 
@@ -323,7 +342,7 @@ class FLReputationEnv(MultiAgentEnv):
         # carries forward the updated reputation column)
         self._generate_state(initial=False)
 
-        terminated = self._round >= self.max_rounds
+        terminated = self._round >= self._episode_max_rounds
 
         # Build per-agent return dicts using the pre-built id list to avoid
         # repeated f-string formatting — at 100 agents per step this matters.
@@ -401,7 +420,8 @@ class FLReputationEnv(MultiAgentEnv):
         # Convergence progress t ∈ [0, 1] over the episode.
         # At t=0 (round 0) decay=1 → original distributions.
         # At t=1 (final round) decay→e^{-2}≈0.135, decay_soft→e^{-0.8}≈0.449.
-        t          = np.float32(self._round / self.max_rounds)
+        # Uses _episode_max_rounds (randomized per episode) for short-episode training.
+        t          = np.float32(self._round / self._episode_max_rounds)
         decay      = np.float32(np.exp(-2.0 * t))   # aggressive: _LOSS, _MAG
         decay_soft = np.float32(np.exp(-0.8 * t))   # gentle:     _ACC
 
@@ -489,16 +509,18 @@ class FLReputationEnv(MultiAgentEnv):
     ) -> tuple[float, dict[str, Any]]:
         """Compute the scalar reward for a given weight vector.
 
-        Reward = alpha * weighted_accuracy
-               - beta * attack_impact
+        Reward = alpha * weighted_similarity
+               - beta * malicious_weight_penalty
                - delta * low_sim_penalty
-               + zeta * consistency_bonus
-               - lambda * |weight_sum - 1|
+               + eta * improvement_bonus
+               - norm_penalty
 
-        The low_sim_penalty and consistency_bonus use gradient_similarity (_SIM),
-        which is a server-computed feature that cannot be falsified by clients.
-        This makes the reward more robust than relying solely on client-reported
-        accuracy_contribution.
+        The reward is anchored entirely on gradient_similarity (_SIM), a
+        server-computed feature that cannot be falsified by clients. The old
+        weighted_accuracy term (based on client-reported accuracy_contribution)
+        has been removed because it is falsifiable. The old consistency_bonus
+        (Pearson correlation) has been replaced with an improvement_bonus that
+        rewards round-over-round improvement in weighted similarity.
 
         All operations are vectorized numpy; no Python loops in the hot path.
         Pre-allocated buffers (_p_buffer) avoid per-call allocation.
@@ -514,69 +536,65 @@ class FLReputationEnv(MultiAgentEnv):
         # Guard against all-zero weights (agent refuses to aggregate anything)
         if weight_sum < self._wsum_eps:
             return -1.0, {
-                "weighted_accuracy": 0.0,
-                "attack_impact": 1.0,
+                "weighted_similarity": 0.0,
+                "malicious_weight_penalty": 1.0,
                 "low_sim_penalty": 1.0,
-                "consistency_bonus": 0.0,
+                "improvement_bonus": 0.0,
                 "norm_penalty": float(self._norm_penalty_lambda),
                 "reward": -1.0,
             }
 
         inv_weight_sum = np.float32(1.0 / weight_sum)  # pre-compute reciprocal
 
-        # Weighted accuracy: dot product of weights and accuracy contributions,
-        # normalized by total weight — measures quality of aggregated model
-        acc_contributions = self._state[:, _ACC]  # view, no copy
-        weighted_accuracy = float(np.dot(weights, acc_contributions) * inv_weight_sum)
+        # Weighted similarity: dot product of weights and gradient similarities,
+        # normalized by total weight. Uses server-computed _SIM which is
+        # non-falsifiable — the primary quality signal for aggregation.
+        similarities = self._state[:, _SIM]  # view, no copy
+        weighted_similarity = float(np.dot(weights, similarities) * inv_weight_sum)
 
-        # Attack impact: fraction of total weight allocated to malicious clients
+        # Malicious weight penalty: fraction of total weight allocated to
+        # malicious clients — directly penalises giving weight to attackers.
         malicious_weight = float(np.sum(weights[self._malicious_mask]))
-        attack_impact = malicious_weight * inv_weight_sum
+        malicious_weight_penalty = float(malicious_weight * inv_weight_sum)
 
         # --- Low-similarity penalty (server-computed, non-falsifiable) ---
         # Penalise giving weight to clients with low gradient similarity.
         # Gradient similarity is the strongest server-side signal for detecting
         # poisoned updates — it cannot be faked by the client.
-        similarities = self._state[:, _SIM]  # view, no copy
         # Weighted mean of (1 - similarity): high penalty when weight goes to
         # low-similarity clients
         low_sim_penalty = float(
             np.dot(weights, 1.0 - similarities) * inv_weight_sum
         )
 
-        # --- Consistency bonus (reward alignment with similarity) ---
-        # Pearson correlation between normalised weights and similarity scores.
-        # Reward is positive when weights track similarity (agent trusts
-        # high-similarity clients more). Range: [-1, 1], clipped to [0, 1].
-        norm_weights = weights * inv_weight_sum
-        w_mean = norm_weights.mean()
-        s_mean = similarities.mean()
-        w_centered = norm_weights - w_mean
-        s_centered = similarities - s_mean
-        cov = float(np.dot(w_centered, s_centered))
-        w_std = float(np.sqrt(np.dot(w_centered, w_centered)))
-        s_std = float(np.sqrt(np.dot(s_centered, s_centered)))
-        if w_std > 1e-8 and s_std > 1e-8:
-            consistency_bonus = max(0.0, cov / (w_std * s_std))
-        else:
-            consistency_bonus = 0.0
+        # --- Improvement bonus (replaces consistency bonus) ---
+        # Rewards round-over-round improvement in weighted similarity.
+        # This encourages the agent to learn policies that progressively
+        # improve aggregation quality rather than merely correlating with
+        # a heuristic. Only positive improvements are rewarded (no penalty
+        # for regression — that is already captured by the similarity term).
+        improvement = max(0.0, weighted_similarity - self._prev_weighted_sim)
+        improvement_bonus = float(improvement)
+
+        # Update tracking for next round's improvement computation
+        self._prev_weighted_sim = weighted_similarity
 
         # Normalization penalty — penalises raw weight sums far from 1.0.
         norm_penalty = float(self._norm_penalty_lambda * abs(weight_sum - 1.0))
 
         reward = float(
-            self.alpha * weighted_accuracy
-            - self.beta * attack_impact
+            self.alpha * weighted_similarity
+            - self.beta * malicious_weight_penalty
             - self.delta * low_sim_penalty
-            + self.zeta * consistency_bonus
+            + self.eta * improvement_bonus
             - norm_penalty
         )
 
         info: dict[str, Any] = {
-            "weighted_accuracy": weighted_accuracy,
-            "attack_impact": float(attack_impact),
+            "weighted_similarity": weighted_similarity,
+            "malicious_weight_penalty": malicious_weight_penalty,
             "low_sim_penalty": low_sim_penalty,
-            "consistency_bonus": consistency_bonus,
+            "improvement_bonus": improvement_bonus,
             "norm_penalty": norm_penalty,
             "reward": reward,
         }

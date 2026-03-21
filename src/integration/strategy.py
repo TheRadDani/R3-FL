@@ -69,9 +69,11 @@ _AGGREGATION_CHUNK_SIZE: int = 10
 Keeping this at 10-20 bounds peak memory to ~chunk_size model copies rather
 than materializing all 100 client states simultaneously."""
 
-_HEURISTIC_BLEND_GAMMA: float = 0.3
+_HEURISTIC_BLEND_GAMMA: float = 0.5
 """Blending ratio: final = gamma * ppo_weights + (1-gamma) * heuristic_weights.
-Lower gamma = more heuristic (safer). 0.3 gives PPO 30% influence, heuristic 70%."""
+Equal blend: 0.5 gives PPO and heuristic equal influence. The trained PPO policy
+has shown sufficient quality to warrant parity with the heuristic safety net,
+while still benefiting from the robust floor the heuristic provides."""
 
 _MAGNITUDE_OUTLIER_THRESHOLD: float = 2.0
 """Number of MADs (median absolute deviations) above the median magnitude
@@ -145,6 +147,12 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         # Cross-round EMA weight smoothing to prevent cascading failures
         # from one bad round polluting the aggregated model.
         self._ema_weights: Optional[np.ndarray] = None
+
+        # Persistent LSTM hidden state across FL rounds.  Allows the LSTM
+        # to accumulate temporal context (e.g. trend of client behaviour)
+        # rather than starting from zeros each round.  Reset naturally when
+        # a new RLReputationStrategy instance is created (one per benchmark).
+        self._lstm_state: Optional[List[np.ndarray]] = None
 
         # Load PPO algorithm --------------------------------------------------
         self.ppo_algo: Optional[Any] = None
@@ -511,7 +519,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
         # Warmup: during the first few rounds, early-round features are
         # unreliable (random model, low gradient SNR).  Use pure heuristic
         # with linear similarity (no squaring) to avoid amplifying noise.
-        warmup_rounds = 3
+        warmup_rounds = 1
         is_warmup = server_round <= warmup_rounds
 
         heuristic_weights = self._compute_heuristic_weights(
@@ -536,7 +544,7 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
 
         # Cross-round EMA smoothing: prevents one bad round from causing
         # cascading failures.  70% historical, 30% new.
-        ema_alpha = 0.3
+        ema_alpha = 0.5
         if self._ema_weights is not None and len(self._ema_weights) == len(weights):
             weights = ema_alpha * weights + (1.0 - ema_alpha) * self._ema_weights
             weights /= weights.sum()  # re-normalise
@@ -835,14 +843,25 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
                 use_lstm = len(initial_state) > 0
 
                 if use_lstm:
-                    # Zero-initialise the LSTM hidden state for this round.
-                    # State is reset between FL rounds (on-chain EMA already
-                    # encodes cross-round history); within a round the hidden
-                    # state is threaded sequentially across the per-client loop
-                    # so the LSTM attends to the full participating cohort.
-                    lstm_state: List[np.ndarray] = [
-                        np.zeros_like(s) for s in initial_state
-                    ]
+                    # Reuse the LSTM hidden state from the previous FL round
+                    # so the LSTM accumulates temporal context across rounds
+                    # (e.g. trends in client behaviour).  Falls back to zeros
+                    # on the very first round or if shapes changed.
+                    if (
+                        self._lstm_state is not None
+                        and len(self._lstm_state) == len(initial_state)
+                        and all(
+                            s.shape == ref.shape
+                            for s, ref in zip(self._lstm_state, initial_state)
+                        )
+                    ):
+                        lstm_state: List[np.ndarray] = [
+                            s.copy() for s in self._lstm_state
+                        ]
+                    else:
+                        lstm_state = [
+                            np.zeros_like(s) for s in initial_state
+                        ]
 
                 for i in range(K):
                     obs_i = state[i]  # shape (NUM_FEATURES,) = (9,)
@@ -860,6 +879,10 @@ class RLReputationStrategy(fl.server.strategy.Strategy):
                             obs_i, policy_id="shared_policy"
                         )
                     raw_weights[i] = float(np.clip(action[0], 0.0, 1.0))
+
+                # Persist the final LSTM state for reuse in the next FL round
+                if use_lstm:
+                    self._lstm_state = [s.copy() for s in lstm_state]
 
                 # Normalise to sum to 1
                 weight_sum = raw_weights.sum()

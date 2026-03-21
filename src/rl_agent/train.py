@@ -80,20 +80,71 @@ ENV_NAME: str = "FLReputationEnv-v0"
 def env_creator(env_config: dict) -> FLReputationEnv:
     """Factory function for RLlib environment registration.
 
+    Creates a FLReputationEnv instance from the RLlib ``env_config`` dict.
+    All parameters have sensible defaults matching FLReputationEnv.__init__
+    and can be overridden via env_config keys.
+
+    Curriculum learning support:
+        If ``env_config["curriculum_phase"]`` is set (1, 2, or 3), it overrides
+        ``malicious_fraction`` and ``min_rounds`` to provide a staged difficulty
+        ramp for training:
+
+        - Phase 1 (easy):   malicious_fraction=0.1, min_rounds=20
+        - Phase 2 (medium): malicious_fraction=0.3, min_rounds=10
+        - Phase 3 (hard):   malicious_fraction=0.5, min_rounds=5
+
+        Other parameters (alpha, beta, delta, eta, max_rounds, num_clients)
+        can still be overridden alongside curriculum_phase.
+
     Args:
         env_config: Configuration dict passed from RLlib's ``env_config``.
 
     Returns:
         A new FLReputationEnv instance.
     """
+    # Base parameters — defaults match FLReputationEnv.__init__
+    alpha = env_config.get("alpha", 0.5)
+    beta = env_config.get("beta", 0.3)
+    delta = env_config.get("delta", 0.3)
+    eta = env_config.get("eta", 0.3)
+    malicious_fraction = env_config.get("malicious_fraction", 0.3)
+    max_rounds = env_config.get("max_rounds", 200)
+    min_rounds = env_config.get("min_rounds", 5)
+    num_clients = env_config.get("num_clients", NUM_CLIENTS)
+
+    # Curriculum learning — override malicious_fraction and min_rounds
+    # based on the training phase.  This is opt-in: if curriculum_phase
+    # is not set, the base parameters above are used unchanged.
+    curriculum_phase = env_config.get("curriculum_phase")
+    if curriculum_phase is not None:
+        _CURRICULUM = {
+            1: {"malicious_fraction": 0.1, "min_rounds": 20},  # easy
+            2: {"malicious_fraction": 0.3, "min_rounds": 10},  # medium
+            3: {"malicious_fraction": 0.5, "min_rounds": 5},   # hard
+        }
+        phase_cfg = _CURRICULUM.get(curriculum_phase)
+        if phase_cfg is None:
+            raise ValueError(
+                f"Invalid curriculum_phase={curriculum_phase!r}; expected 1, 2, or 3."
+            )
+        malicious_fraction = phase_cfg["malicious_fraction"]
+        min_rounds = phase_cfg["min_rounds"]
+        logger.info(
+            "Curriculum phase %d: malicious_fraction=%.1f, min_rounds=%d",
+            curriculum_phase,
+            malicious_fraction,
+            min_rounds,
+        )
+
     return FLReputationEnv(
-        alpha=env_config.get("alpha", 0.6),
-        beta=env_config.get("beta", 0.4),
-        delta=env_config.get("delta", 0.3),
-        zeta=env_config.get("zeta", 0.2),
-        malicious_fraction=env_config.get("malicious_fraction", 0.3),
-        max_rounds=env_config.get("max_rounds", 200),
-        num_clients=env_config.get("num_clients", NUM_CLIENTS),
+        alpha=alpha,
+        beta=beta,
+        delta=delta,
+        eta=eta,
+        malicious_fraction=malicious_fraction,
+        max_rounds=max_rounds,
+        min_rounds=min_rounds,
+        num_clients=num_clients,
     )
 
 
