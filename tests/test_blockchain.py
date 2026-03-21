@@ -403,3 +403,60 @@ class TestBatchUpdateClients:
                     losses=[10],
                     magnitudes=[30],
                 )
+
+
+# =========================================================================
+# Additional web3_utils Tests (coverage expansion)
+# =========================================================================
+
+class TestGetWeb3Simple:
+    """Simple unit tests for Web3 connection management."""
+
+    def test_get_web3_returns_web3_instance(self, mock_web3):
+        """get_web3 should return a Web3 instance."""
+        with patch.object(web3_mod, "_w3", None), \
+             patch("src.blockchain.web3_utils.Web3") as MockWeb3:
+            MockWeb3.return_value = mock_web3
+            result = web3_mod.get_web3()
+
+            assert result is not None
+
+
+class TestUpdateClientScoreAdditional:
+    """Additional tests for update_client_score."""
+
+    def test_update_client_score_negative_score(self, mock_web3, mock_contract):
+        """update_client_score should handle negative scores."""
+        mock_tx_hash = MagicMock()
+        mock_tx_hash.hex.return_value = "0xupdate123"
+        mock_contract.functions.updateClient.return_value.transact.return_value = mock_tx_hash
+        mock_web3.eth.wait_for_transaction_receipt.return_value = MagicMock()
+
+        with patch.object(web3_mod, "get_web3", return_value=mock_web3), \
+             patch.object(web3_mod, "get_contract", return_value=mock_contract):
+            result = web3_mod.update_client_score(
+                client_address="0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+                score=-50,
+                cid="ipfs-key",
+            )
+
+            assert result == "0xupdate123"
+
+
+class TestGetClientScoreAdditional:
+    """Additional tests for get_client_score."""
+
+    def test_get_client_score_returns_dict_structure(self, mock_web3, mock_contract):
+        """get_client_score should return dict with expected keys."""
+        mock_record = (100, "ipfs-key", 50, 75, 12345)
+        mock_contract.functions.getClient.return_value.call.return_value = mock_record
+
+        with patch.object(web3_mod, "get_web3", return_value=mock_web3), \
+             patch.object(web3_mod, "get_contract", return_value=mock_contract):
+            result = web3_mod.get_client_score(
+                "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+            )
+
+            assert isinstance(result, dict)
+            assert "reputationScore" in result
+            assert "gradientCidHash" in result

@@ -607,3 +607,91 @@ class TestFlowerClient:
         _, _, metrics = label_flipper_client.fit(parameters=params, config={})
         assert metrics["malicious_type"] == "label_flipper"
         assert metrics["client_id"] == 1
+
+
+# =========================================================================
+# Server Module Tests (server.py)
+# =========================================================================
+
+from src.fl_core.server import (
+    _get_client_resources,
+    get_malicious_type,
+    weighted_average_metrics,
+    make_client_fn,
+)
+
+
+class TestGetClientResources:
+    """Unit tests for GPU resource detection in server."""
+
+    def test_returns_dict_with_cpu_key(self):
+        """_get_client_resources should return dict with num_cpus."""
+        resources = _get_client_resources()
+
+        assert isinstance(resources, dict)
+        assert "num_cpus" in resources
+        assert resources["num_cpus"] == 1
+
+    def test_returns_dict_with_gpu_key(self):
+        """_get_client_resources should return dict with num_gpus."""
+        resources = _get_client_resources()
+
+        assert "num_gpus" in resources
+
+
+class TestGetMaliciousType:
+    """Unit tests for malicious client type assignment."""
+
+    def test_label_flipper_range(self):
+        """Clients 0-14 should be label_flippers."""
+        for client_id in range(15):
+            m_type = get_malicious_type(client_id)
+            assert m_type == "label_flipper"
+
+    def test_noise_injector_range(self):
+        """Clients 15-29 should be noise_injectors."""
+        for client_id in range(15, 30):
+            m_type = get_malicious_type(client_id)
+            assert m_type == "noise_injector"
+
+    def test_honest_clients_range(self):
+        """Clients 30+ should be honest (none)."""
+        for client_id in range(30, 100):
+            m_type = get_malicious_type(client_id)
+            assert m_type == "none"
+
+
+class TestWeightedAverageMetrics:
+    """Unit tests for metric aggregation function."""
+
+    def test_empty_metrics_returns_empty_dict(self):
+        """Empty metrics list should return {}."""
+        result = weighted_average_metrics([])
+        assert result == {}
+
+    def test_single_client_accuracy(self):
+        """Single client should return its accuracy."""
+        metrics = [(10, {"accuracy": 0.85})]
+        result = weighted_average_metrics(metrics)
+
+        assert "accuracy" in result
+        assert result["accuracy"] == pytest.approx(0.85)
+
+    def test_weighted_average_calculation(self):
+        """Multiple clients should be averaged by sample count."""
+        metrics = [
+            (10, {"accuracy": 0.80}),
+            (20, {"accuracy": 0.90}),
+        ]
+        result = weighted_average_metrics(metrics)
+
+        # (10*0.80 + 20*0.90) / 30 = 26/30 ≈ 0.867
+        expected = (10 * 0.80 + 20 * 0.90) / 30
+        assert result["accuracy"] == pytest.approx(expected)
+
+    def test_zero_samples_returns_zero_accuracy(self):
+        """Zero total samples should return 0.0 accuracy."""
+        metrics = [(0, {"accuracy": 0.85})]
+        result = weighted_average_metrics(metrics)
+
+        assert result["accuracy"] == pytest.approx(0.0)

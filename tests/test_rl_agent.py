@@ -869,3 +869,284 @@ class TestConstructorConfiguration:
         """Default render_mode should be None."""
         e = FLReputationEnv()
         assert e.render_mode is None
+
+
+# =========================================================================
+# Kernels Tests (reward normalization, Triton fallback, RunningMeanStd)
+# =========================================================================
+
+import torch
+
+from src.rl_agent.kernels import (
+    TRITON_AVAILABLE,
+    RunningMeanStd,
+    fused_reward_normalize,
+    _torch_normalize,
+)
+
+
+class TestRunningMeanStd:
+    """Unit tests for RunningMeanStd class (Welford online algorithm)."""
+
+    def test_initialization(self) -> None:
+        """RunningMeanStd should initialize with mean=0, var=epsilon, count=0."""
+        rms = RunningMeanStd(epsilon=1e-4, device="cpu")
+        assert float(rms.mean) == pytest.approx(0.0)
+        assert float(rms.var) == pytest.approx(1e-4)
+        assert int(rms.count) == 0
+
+    def test_single_batch_update(self) -> None:
+        """After one batch update, mean and var should match batch statistics."""
+        rms = RunningMeanStd()
+        batch = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float32)
+        rms.update(batch)
+
+        expected_mean = batch.mean().item()
+        expected_var = batch.var(unbiased=False).item()
+
+        assert float(rms.mean) == pytest.approx(expected_mean, rel=1e-5)
+        assert float(rms.var) == pytest.approx(expected_var, rel=1e-5)
+        assert int(rms.count) == 5
+
+    def test_multiple_batch_updates_welford(self) -> None:
+        """Multiple batches should correctly merge via Welford algorithm."""
+        rms = RunningMeanStd()
+
+        batch1 = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        batch2 = torch.tensor([4.0, 5.0], dtype=torch.float32)
+
+        rms.update(batch1)
+        rms.update(batch2)
+
+        # Expected: mean=(1+2+3+4+5)/5=3.0, var of [1,2,3,4,5] unbiased
+        all_data = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+        expected_mean = all_data.mean().item()
+        expected_var = all_data.var(unbiased=False).item()
+
+        assert float(rms.mean) == pytest.approx(expected_mean, rel=1e-5)
+        assert float(rms.var) == pytest.approx(expected_var, rel=1e-5)
+        assert int(rms.count) == 5
+
+    def test_empty_batch_no_update(self) -> None:
+        """Updating with an empty batch should not change statistics."""
+        rms = RunningMeanStd()
+        initial_mean = float(rms.mean)
+        initial_var = float(rms.var)
+        initial_count = int(rms.count)
+
+        rms.update(torch.tensor([], dtype=torch.float32))
+
+        assert float(rms.mean) == initial_mean
+        assert float(rms.var) == initial_var
+        assert int(rms.count) == initial_count
+
+    def test_std_property_clamped(self) -> None:
+        """std property should return sqrt(var), clamped to >= 1e-8."""
+        rms = RunningMeanStd(epsilon=1e-4)
+        rms.update(torch.tensor([1.0], dtype=torch.float32))
+
+        std = rms.std
+        assert float(std) >= 0.99e-8  # Allow small floating point tolerance
+        assert float(std) == pytest.approx(torch.sqrt(rms.var).clamp(min=1e-8).item(), rel=1e-6)
+
+    def test_large_batch_numerical_stability(self) -> None:
+        """Large batches should not overflow or underflow."""
+        rms = RunningMeanStd()
+        large_batch = torch.linspace(1e6, 1e7, 1000, dtype=torch.float32)
+        rms.update(large_batch)
+
+        assert not torch.isnan(rms.mean)
+        assert not torch.isnan(rms.var)
+        assert float(rms.mean) > 0
+
+    def test_negative_values_handled(self) -> None:
+        """Negative batch values should be handled correctly."""
+        rms = RunningMeanStd()
+        batch = torch.tensor([-5.0, -2.0, 0.0, 2.0, 5.0], dtype=torch.float32)
+        rms.update(batch)
+
+        expected_mean = batch.mean().item()
+        assert float(rms.mean) == pytest.approx(expected_mean, rel=1e-5)
+
+
+class TestFusedRewardNormalize:
+    """Unit tests for fused_reward_normalize function."""
+
+    def test_returns_tensor_same_shape(self) -> None:
+        """Normalized output should have same shape as input."""
+        rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float32)
+        normalized = fused_reward_normalize(rewards, mean=3.0, std=1.0)
+
+        assert normalized.shape == rewards.shape
+        assert normalized.dtype == torch.float32
+
+    def test_zero_std_handled_with_epsilon(self) -> None:
+        """Division by zero should be avoided via epsilon."""
+        rewards = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        normalized = fused_reward_normalize(rewards, mean=2.0, std=0.0, epsilon=1e-8)
+
+        # Should not contain inf or nan
+        assert not torch.isnan(normalized).any()
+        assert not torch.isinf(normalized).any()
+
+    def test_correct_normalization_computation(self) -> None:
+        """Normalized output should be (rewards - mean) / (std + epsilon)."""
+        rewards = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        mean, std, epsilon = 2.0, 1.0, 1e-8
+
+        normalized = fused_reward_normalize(rewards, mean=mean, std=std, epsilon=epsilon)
+
+        expected = (rewards - mean) / (std + epsilon)
+        assert torch.allclose(normalized, expected, atol=1e-6)
+
+    def test_cpu_path_always_works(self) -> None:
+        """PyTorch fallback should work on CPU."""
+        rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float32)
+        normalized = fused_reward_normalize(rewards, mean=3.0, std=1.4)
+
+        # Should not error; should produce finite values
+        assert normalized.shape == rewards.shape
+        assert not torch.isnan(normalized).any()
+
+
+class TestTorchNormalize:
+    """Unit tests for the PyTorch fallback normalization (_torch_normalize)."""
+
+    def test_torch_normalize_correctness(self) -> None:
+        """_torch_normalize should match manual formula."""
+        rewards = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float32)
+        mean_val, std_val, epsilon = 2.5, 1.1, 1e-8
+
+        result = _torch_normalize(rewards, mean_val, std_val, epsilon)
+
+        expected = (rewards - mean_val) / (std_val + epsilon)
+        assert torch.allclose(result, expected, atol=1e-6)
+
+    def test_torch_normalize_zero_std(self) -> None:
+        """_torch_normalize should handle zero std via epsilon."""
+        rewards = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        result = _torch_normalize(rewards, mean_val=2.0, std_val=0.0, epsilon=1e-8)
+
+        assert not torch.isinf(result).any()
+        assert not torch.isnan(result).any()
+
+
+# =========================================================================
+# Train Function Tests (configuration, GPU detection, PPO setup)
+# =========================================================================
+
+from src.rl_agent.train import (
+    env_creator,
+    _detect_gpu_resources,
+    build_ppo_config,
+)
+
+
+class TestEnvCreator:
+    """Unit tests for env_creator factory function."""
+
+    def test_env_creator_default_config(self) -> None:
+        """env_creator with empty config should use defaults."""
+        env = env_creator({})
+
+        assert isinstance(env, FLReputationEnv)
+        assert env.alpha == pytest.approx(0.5)
+        assert env.beta == pytest.approx(0.3)
+        assert env.malicious_fraction == pytest.approx(0.3)
+
+    def test_env_creator_custom_parameters(self) -> None:
+        """env_creator should respect custom config parameters."""
+        config = {
+            "alpha": 0.7,
+            "beta": 0.2,
+            "malicious_fraction": 0.5,
+            "num_clients": 50,
+        }
+        env = env_creator(config)
+
+        assert env.alpha == pytest.approx(0.7)
+        assert env.beta == pytest.approx(0.2)
+        assert env.malicious_fraction == pytest.approx(0.5)
+        assert env.num_clients == 50
+
+    def test_env_creator_curriculum_phase_1(self) -> None:
+        """Curriculum phase 1 should set easy difficulty."""
+        config = {"curriculum_phase": 1}
+        env = env_creator(config)
+
+        assert env.malicious_fraction == pytest.approx(0.1)
+        assert env.min_rounds == 20
+
+    def test_env_creator_curriculum_phase_2(self) -> None:
+        """Curriculum phase 2 should set medium difficulty."""
+        config = {"curriculum_phase": 2}
+        env = env_creator(config)
+
+        assert env.malicious_fraction == pytest.approx(0.3)
+        assert env.min_rounds == 10
+
+    def test_env_creator_curriculum_phase_3(self) -> None:
+        """Curriculum phase 3 should set hard difficulty."""
+        config = {"curriculum_phase": 3}
+        env = env_creator(config)
+
+        assert env.malicious_fraction == pytest.approx(0.5)
+        assert env.min_rounds == 5
+
+    def test_env_creator_invalid_curriculum_phase(self) -> None:
+        """Invalid curriculum phase should raise ValueError."""
+        config = {"curriculum_phase": 4}
+        with pytest.raises(ValueError, match="Invalid curriculum_phase"):
+            env_creator(config)
+
+
+class TestDetectGpuResources:
+    """Unit tests for GPU resource detection."""
+
+    def test_returns_tuple(self) -> None:
+        """_detect_gpu_resources should return (int, float) tuple."""
+        result = _detect_gpu_resources()
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], int)
+        assert isinstance(result[1], float)
+
+    def test_gpu_allocation_sum(self) -> None:
+        """When GPU available, allocation should be sensible."""
+        num_gpus, worker_gpus = _detect_gpu_resources()
+
+        if torch.cuda.is_available():
+            # Learner gets all GPUs
+            assert num_gpus == torch.cuda.device_count()
+            # Workers should get 0 when GPUs available (CPU-only rollouts)
+            assert worker_gpus == 0.0
+        else:
+            # No GPU: both should be 0
+            assert num_gpus == 0
+            assert worker_gpus == 0.0
+
+
+class TestBuildPpoConfig:
+    """Unit tests for build_ppo_config function."""
+
+    def test_config_builds_without_error(self) -> None:
+        """build_ppo_config should return valid PPOConfig."""
+        config = build_ppo_config(num_workers=2)
+
+        assert config is not None
+        # PPOConfig should have build() method
+        assert hasattr(config, 'build')
+
+    def test_config_env_config_passed(self) -> None:
+        """Config should accept and use env_config parameter."""
+        env_cfg = {"malicious_fraction": 0.5, "num_clients": 50}
+        config = build_ppo_config(num_workers=2, env_config=env_cfg)
+
+        assert config is not None
+
+    def test_config_with_empty_env_config(self) -> None:
+        """Config should handle empty env_config dict."""
+        config = build_ppo_config(num_workers=2, env_config={})
+
+        assert config is not None
