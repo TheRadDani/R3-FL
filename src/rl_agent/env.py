@@ -97,11 +97,18 @@ class FLReputationEnv(MultiAgentEnv):
     same global reward signal.
 
     Reward:
-        R = alpha * weighted_accuracy - beta * attack_impact
+        R = alpha * weighted_accuracy
+          - beta * attack_impact
+          - delta * low_sim_penalty
+          + zeta * consistency_bonus
 
     Args:
         alpha: Weight for the accuracy term in the reward (default 0.6).
         beta: Weight for the attack-impact penalty in the reward (default 0.4).
+        delta: Penalty for assigning weight to clients with low gradient_similarity
+            (default 0.3). This uses server-computed features that cannot be falsified.
+        zeta: Bonus for weight-similarity correlation (default 0.2). Rewards the
+            agent when its weights align with gradient similarity scores.
         malicious_fraction: Proportion of clients that are malicious (default 0.3).
         max_rounds: Maximum FL rounds per episode (default 200).
         num_clients: Number of FL clients in the federation (default NUM_CLIENTS=100).
@@ -120,6 +127,8 @@ class FLReputationEnv(MultiAgentEnv):
         self,
         alpha: float = 0.6,
         beta: float = 0.4,
+        delta: float = 0.3,
+        zeta: float = 0.2,
         malicious_fraction: float = 0.3,
         max_rounds: int = 200,
         num_clients: int = NUM_CLIENTS,
@@ -130,6 +139,8 @@ class FLReputationEnv(MultiAgentEnv):
         # Reward hyper-parameters
         self.alpha = np.float32(alpha)   # cast once at init — avoids silent float64 promotion
         self.beta = np.float32(beta)
+        self.delta = np.float32(delta)   # low-similarity penalty coefficient
+        self.zeta = np.float32(zeta)     # consistency bonus coefficient
 
         # Episode configuration
         self.malicious_fraction = malicious_fraction
@@ -228,8 +239,14 @@ class FLReputationEnv(MultiAgentEnv):
         # Manage RNG directly (MultiAgentEnv doesn't use gymnasium's seed protocol)
         self._rng = np.random.default_rng(seed)
 
-        # Randomly designate malicious clients for this episode
-        num_malicious = int(self.num_clients * self.malicious_fraction)
+        # Vary the malicious fraction slightly each episode to improve
+        # generalization across different attack intensities (+-10%).
+        effective_fraction = np.clip(
+            self.malicious_fraction + self._rng.uniform(-0.1, 0.1),
+            0.05,  # at least 1 malicious client
+            0.5,   # at most half
+        )
+        num_malicious = max(1, int(self.num_clients * effective_fraction))
         malicious_indices = self._rng.choice(
             self.num_clients, size=num_malicious, replace=False
         )
@@ -472,7 +489,16 @@ class FLReputationEnv(MultiAgentEnv):
     ) -> tuple[float, dict[str, Any]]:
         """Compute the scalar reward for a given weight vector.
 
-        Reward = alpha * weighted_accuracy - beta * attack_impact - lambda * |weight_sum - 1|
+        Reward = alpha * weighted_accuracy
+               - beta * attack_impact
+               - delta * low_sim_penalty
+               + zeta * consistency_bonus
+               - lambda * |weight_sum - 1|
+
+        The low_sim_penalty and consistency_bonus use gradient_similarity (_SIM),
+        which is a server-computed feature that cannot be falsified by clients.
+        This makes the reward more robust than relying solely on client-reported
+        accuracy_contribution.
 
         All operations are vectorized numpy; no Python loops in the hot path.
         Pre-allocated buffers (_p_buffer) avoid per-call allocation.
@@ -490,6 +516,8 @@ class FLReputationEnv(MultiAgentEnv):
             return -1.0, {
                 "weighted_accuracy": 0.0,
                 "attack_impact": 1.0,
+                "low_sim_penalty": 1.0,
+                "consistency_bonus": 0.0,
                 "norm_penalty": float(self._norm_penalty_lambda),
                 "reward": -1.0,
             }
@@ -502,25 +530,53 @@ class FLReputationEnv(MultiAgentEnv):
         weighted_accuracy = float(np.dot(weights, acc_contributions) * inv_weight_sum)
 
         # Attack impact: fraction of total weight allocated to malicious clients
-        # np.dot with boolean mask is equivalent to np.sum(weights[mask])
         malicious_weight = float(np.sum(weights[self._malicious_mask]))
         attack_impact = malicious_weight * inv_weight_sum
 
+        # --- Low-similarity penalty (server-computed, non-falsifiable) ---
+        # Penalise giving weight to clients with low gradient similarity.
+        # Gradient similarity is the strongest server-side signal for detecting
+        # poisoned updates — it cannot be faked by the client.
+        similarities = self._state[:, _SIM]  # view, no copy
+        # Weighted mean of (1 - similarity): high penalty when weight goes to
+        # low-similarity clients
+        low_sim_penalty = float(
+            np.dot(weights, 1.0 - similarities) * inv_weight_sum
+        )
+
+        # --- Consistency bonus (reward alignment with similarity) ---
+        # Pearson correlation between normalised weights and similarity scores.
+        # Reward is positive when weights track similarity (agent trusts
+        # high-similarity clients more). Range: [-1, 1], clipped to [0, 1].
+        norm_weights = weights * inv_weight_sum
+        w_mean = norm_weights.mean()
+        s_mean = similarities.mean()
+        w_centered = norm_weights - w_mean
+        s_centered = similarities - s_mean
+        cov = float(np.dot(w_centered, s_centered))
+        w_std = float(np.sqrt(np.dot(w_centered, w_centered)))
+        s_std = float(np.sqrt(np.dot(s_centered, s_centered)))
+        if w_std > 1e-8 and s_std > 1e-8:
+            consistency_bonus = max(0.0, cov / (w_std * s_std))
+        else:
+            consistency_bonus = 0.0
+
         # Normalization penalty — penalises raw weight sums far from 1.0.
-        # Without this, any weight vector proportional to the optimal one
-        # yields the same normalised result, making the value function
-        # unable to distinguish scale, which slows policy convergence.
         norm_penalty = float(self._norm_penalty_lambda * abs(weight_sum - 1.0))
 
         reward = float(
             self.alpha * weighted_accuracy
             - self.beta * attack_impact
+            - self.delta * low_sim_penalty
+            + self.zeta * consistency_bonus
             - norm_penalty
         )
 
         info: dict[str, Any] = {
             "weighted_accuracy": weighted_accuracy,
             "attack_impact": float(attack_impact),
+            "low_sim_penalty": low_sim_penalty,
+            "consistency_bonus": consistency_bonus,
             "norm_penalty": norm_penalty,
             "reward": reward,
         }

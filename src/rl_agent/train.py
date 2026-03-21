@@ -89,6 +89,8 @@ def env_creator(env_config: dict) -> FLReputationEnv:
     return FLReputationEnv(
         alpha=env_config.get("alpha", 0.6),
         beta=env_config.get("beta", 0.4),
+        delta=env_config.get("delta", 0.3),
+        zeta=env_config.get("zeta", 0.2),
         malicious_fraction=env_config.get("malicious_fraction", 0.3),
         max_rounds=env_config.get("max_rounds", 200),
         num_clients=env_config.get("num_clients", NUM_CLIENTS),

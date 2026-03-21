@@ -101,8 +101,10 @@ def _benchmark_client_resources(num_concurrent_clients: int = 10) -> Dict[str, f
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
         gpu_fraction = num_gpus / max(num_concurrent_clients, 1)
-        return {"num_cpus": 2, "num_gpus": gpu_fraction}
-    return {"num_cpus": 2, "num_gpus": 0.0}
+        return {"num_cpus": 1, "num_gpus": gpu_fraction}
+    # CPU-only: 1 CPU per client to reduce total memory footprint when
+    # running 10+ concurrent Flower ClientAppActors.
+    return {"num_cpus": 1, "num_gpus": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +145,35 @@ def make_evaluate_fn(test_dataset, device):
 # ============================================================================
 # Base robust strategy with shared boilerplate
 # ============================================================================
+
+def _weighted_average_metrics(
+    metrics: List[Tuple[int, Dict[str, Scalar]]],
+) -> Dict[str, Scalar]:
+    """Aggregate per-client fit/evaluate metrics via weighted average.
+
+    Flower's FedAvg logs a warning when no aggregation function is provided
+    for custom metrics.  This function suppresses that warning by computing
+    a sample-weighted average over all numeric metric values reported by
+    participating clients.
+
+    Args:
+        metrics: List of (num_examples, metrics_dict) tuples from clients.
+
+    Returns:
+        Dictionary of aggregated metric values.
+    """
+    if not metrics:
+        return {}
+    total = sum(n for n, _ in metrics)
+    if total == 0:
+        return {}
+    # Collect all numeric metric keys from the first client
+    first_keys = [k for k, v in metrics[0][1].items() if isinstance(v, (int, float))]
+    return {
+        k: sum(n * m.get(k, 0.0) for n, m in metrics) / total
+        for k in first_keys
+    }
+
 
 class _BaseRobustStrategy(fl.server.strategy.Strategy):
     """Base for custom robust aggregation strategies."""
@@ -400,7 +431,11 @@ def create_strategy(name, num_clients, malicious_fraction, evaluate_fn,
               evaluate_fn=evaluate_fn, initial_parameters=initial_parameters)
 
     if name == "fedavg":
-        return FedAvg(**kw)
+        return FedAvg(
+            fit_metrics_aggregation_fn=_weighted_average_metrics,
+            evaluate_metrics_aggregation_fn=_weighted_average_metrics,
+            **kw,
+        )
     elif name == "krum":
         return KrumStrategy(num_byzantine=max(1, int(min_fit * malicious_fraction)), **kw)
     elif name == "median":
