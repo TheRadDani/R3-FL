@@ -1,25 +1,52 @@
 """Ray RLlib MAPPO training script for the FLReputationEnv.
 
-Trains a Multi-Agent PPO (MAPPO) system with parameter sharing to learn
-optimal aggregation weights for a Federated Learning system with adversarial
-clients.  Each agent corresponds to one FL client and shares a single policy
-network, learning to upweight honest clients and downweight malicious ones.
+Location: src/rl_agent/train.py
+Summary: Multi-Agent Proximal Policy Optimization (MAPPO) training framework for
+         learning reputation-based aggregation weights in federated learning.
+         Uses parameter sharing across agents to train a single policy that learns
+         to upweight honest clients and downweight malicious ones.
 
-Performance features:
-    - Multi-GPU: num_gpus = torch.cuda.device_count() (graceful CPU fallback)
-    - Worker scaling: num_env_runners = min(max(1, os.cpu_count() - 2), 8)
-    - Workers collect rollouts on CPU only; full GPU is reserved for the learner
-    - Mixed-precision hints via torch.set_default_dtype(torch.float32)
-    - CUDA timing around policy inference (exposed via --time-inference flag)
-    - Triton reward normalization kernel imported with graceful fallback
-    - Batch sizes tuned for throughput (train_batch=4000, minibatch=256)
-    - batch_mode=truncate_episodes + rollout_fragment_length=100 drops the per-worker
-      observation buffer to 100 × 100 agents = 10,000 obs per fragment, just below the 250K RLlib warning threshold
+Purpose:
+    Trains a PPO agent on the :class:`FLReputationEnv` environment using Ray RLlib's
+    distributed training. Each FL client is represented as an agent in a MARL setting,
+    all sharing a single policy network. The environment provides per-client observations
+    (update magnitudes, losses, etc.) and the policy learns weighted aggregation decisions.
 
-Usage:
-    python -m src.rl_agent.train
-    python -m src.rl_agent.train --iterations 100 --num-workers 4
-    python -m src.rl_agent.train --iterations 200 --time-inference
+Performance Features:
+    - **Multi-GPU support**: Automatically detects CUDA GPUs and allocates to learner;
+      workers run on CPU for maximum throughput
+    - **Worker scaling**: Automatically uses max(4, cpu_count - 2) workers (capped at 8)
+      to saturate available CPU cores while leaving headroom for the driver
+    - **Efficient batching**: batch_mode="truncate_episodes" + rollout_fragment_length=100
+      reduces per-worker buffering from 20K to 10K observations, preventing "too many
+      observations buffered" warnings
+    - **Triton GPU kernels**: Optional JIT-compiled reward normalization (graceful fallback
+      to PyTorch) for low-overhead running statistics
+    - **LSTM state retention**: Agents retain LSTM state across FL rounds, enabling
+      detection of slow-drift poisoning attacks
+
+Key Classes & Functions:
+    - :func:`env_creator`: Factory function for RLlib environment registration
+    - :func:`build_ppo_config`: Constructs PPOConfig with MAPPO-specific settings
+    - :func:`train`: Main training loop with checkpoint management and metrics tracking
+
+Usage Examples:
+    Basic training (50 iterations):
+        python -m src.rl_agent.train
+
+    Custom iterations and worker count:
+        python -m src.rl_agent.train --iterations 100 --num-workers 4
+
+    Profile GPU inference overhead:
+        python -m src.rl_agent.train --iterations 200 --time-inference
+
+Environment Variables:
+    RAY_memory — Ray actor memory allocation (default: auto)
+    CUDA_VISIBLE_DEVICES — GPU devices available to Ray
+
+See Also:
+    - :mod:`src.rl_agent.env`: FLReputationEnv environment definition
+    - :mod:`src.rl_agent.kernels`: Triton reward normalization kernels
 """
 
 from __future__ import annotations
@@ -80,27 +107,51 @@ ENV_NAME: str = "FLReputationEnv-v0"
 def env_creator(env_config: dict) -> FLReputationEnv:
     """Factory function for RLlib environment registration.
 
-    Creates a FLReputationEnv instance from the RLlib ``env_config`` dict.
-    All parameters have sensible defaults matching FLReputationEnv.__init__
-    and can be overridden via env_config keys.
+    Creates a :class:`FLReputationEnv` instance from the RLlib ``env_config`` dict.
+    All parameters have sensible defaults matching :meth:`FLReputationEnv.__init__`
+    and can be overridden via env_config keys. This function is registered with RLlib
+    via :func:`register_env` so workers can spawn new environments without direct imports.
 
-    Curriculum learning support:
-        If ``env_config["curriculum_phase"]`` is set (1, 2, or 3), it overrides
-        ``malicious_fraction`` and ``min_rounds`` to provide a staged difficulty
-        ramp for training:
+    Curriculum Learning Support:
+        Optionally enables curriculum learning by setting ``env_config["curriculum_phase"]``
+        to 1, 2, or 3. This overrides ``malicious_fraction`` and ``min_rounds`` to provide
+        staged difficulty progression:
 
-        - Phase 1 (easy):   malicious_fraction=0.1, min_rounds=20
-        - Phase 2 (medium): malicious_fraction=0.3, min_rounds=10
-        - Phase 3 (hard):   malicious_fraction=0.5, min_rounds=5
+        - **Phase 1 (easy)**: malicious_fraction=0.1, min_rounds=20
+        - **Phase 2 (medium)**: malicious_fraction=0.3, min_rounds=10
+        - **Phase 3 (hard)**: malicious_fraction=0.5, min_rounds=5
 
-        Other parameters (alpha, beta, delta, eta, max_rounds, num_clients)
-        can still be overridden alongside curriculum_phase.
+        Other parameters (alpha, beta, delta, eta, max_rounds, num_clients) can be
+        freely overridden alongside curriculum_phase; curriculum settings only affect
+        the two parameters listed above.
 
     Args:
-        env_config: Configuration dict passed from RLlib's ``env_config``.
+        env_config (dict): Configuration dict passed from RLlib's ``env_config`` parameter.
+            Expected keys and defaults:
+            - alpha (float): Decay factor for malicious score computation (default 0.5)
+            - beta (float): Weight on loss improvement in reward (default 0.3)
+            - delta (float): Weight on update magnitude in reward (default 0.3)
+            - eta (float): Weight on client participation in reward (default 0.3)
+            - malicious_fraction (float): Fraction of clients marked malicious (default 0.3)
+            - max_rounds (int): Maximum FL training rounds per episode (default 200)
+            - min_rounds (int): Minimum FL rounds before episode can terminate (default 5)
+            - num_clients (int): Total number of simulated FL clients (default :const:`NUM_CLIENTS`)
+            - curriculum_phase (int, optional): Curriculum difficulty level (1, 2, or 3)
 
     Returns:
-        A new FLReputationEnv instance.
+        FLReputationEnv: A newly instantiated environment ready for RLlib rollouts.
+
+    Raises:
+        ValueError: If ``curriculum_phase`` is not None, 1, 2, or 3.
+
+    Example:
+        >>> config = {
+        ...     "alpha": 0.6,
+        ...     "malicious_fraction": 0.2,
+        ...     "curriculum_phase": 2,
+        ... }
+        >>> env = env_creator(config)
+        >>> obs, _ = env.reset()
     """
     # Base parameters — defaults match FLReputationEnv.__init__
     alpha = env_config.get("alpha", 0.5)
@@ -149,14 +200,33 @@ def env_creator(env_config: dict) -> FLReputationEnv:
 
 
 def _detect_gpu_resources() -> tuple[int, float]:
-    """Detect available GPU resources and return training allocation.
+    """Detect available GPU resources and return training allocation strategy.
 
-    Allocates all visible GPUs to the learner.  Rollout workers get a fractional
-    share (0.5 GPU each) so they can batch-infer on GPU without wasting a full
-    device per worker.  Falls back gracefully to CPU when no GPU is present.
+    Inspects system for CUDA GPUs and returns allocation decisions for the learner
+    (policy update process) and rollout workers (environment stepping + inference).
+    Follows the principle: learner gets all GPUs, workers run on CPU only to avoid
+    GPU contention. This maximizes throughput since workers spend most time stepping
+    CPU-only environments, not GPU inference.
+
+    Resource Strategy:
+        - **Learner**: Allocated all visible GPUs (0 if no CUDA available)
+        - **Workers**: Allocated 0 GPUs; they run entirely on CPU
+
+    This avoids the Ray scheduler problem where allocating fractional GPUs to workers
+    (e.g., 0.5 GPU per worker × 30 workers = 15 GPUs required on a single-GPU machine)
+    causes oversubscription. CPUs are saturated via worker scaling (see :func:`build_ppo_config`).
 
     Returns:
-        (num_gpus_learner, num_gpus_per_worker) tuple.
+        tuple[int, float]: A (num_gpus_learner, num_gpus_per_worker) pair.
+            Example: (2, 0.0) means 2 GPUs for learner, 0 for workers.
+            On CPU-only systems: (0, 0.0).
+
+    Example:
+        >>> gpus_learner, gpus_worker = _detect_gpu_resources()
+        >>> if gpus_learner > 0:
+        ...     print(f"Training on {gpus_learner} GPUs")
+        ... else:
+        ...     print("Training on CPU (no CUDA detected)")
     """
     if not torch.cuda.is_available():
         logger.info("No CUDA GPUs detected — training on CPU.")
@@ -181,15 +251,50 @@ def build_ppo_config(
     num_workers: int | None = None,
     env_config: dict | None = None,
 ) -> PPOConfig:
-    """Build a PPOConfig for training on FLReputationEnv.
+    """Build a fully configured PPOConfig for MAPPO training on FLReputationEnv.
+
+    Constructs a :class:`ray.rllib.algorithms.ppo.PPOConfig` with all settings tuned
+    for multi-agent FL reputation learning. Combines worker parallelism (CPU saturation),
+    GPU allocation strategy, and training hyperparameters optimized for fast convergence.
+
+    Worker Scaling:
+        If ``num_workers`` is None, automatically computes workers as:
+        ``min(max(1, os.cpu_count() - 2), 8)``. This reserves 2 cores for the driver/
+        learner process while capping at 8 to prevent oversubscription on many-core
+        machines. Workers are the primary throughput lever in RLlib.
+
+    Batching & Efficiency:
+        - batch_mode="truncate_episodes": Releases rollout fragments at fixed intervals
+          (rollout_fragment_length) rather than waiting for episode completion. Prevents
+          buffering 20K observations and achieves ~1–2 min/iteration instead of ~6:30
+        - rollout_fragment_length=100: With 100 agents, yields 10K observations per
+          fragment (8 workers × 100 agents × 100 steps), just below RLlib's 250K warning
+        - train_batch_size=4000: Standard throughput size; filled in ~5 collection rounds
+
+    Model Architecture (MAPPO):
+        - Two 64-wide hidden layers for per-agent observations (NUM_FEATURES=9 inputs)
+        - LSTM enabled (max_seq_len=20) for temporal context across FL rounds
+        - vf_share_layers=False: Separate actor/critic networks (better MAPPO performance)
 
     Args:
-        num_workers: Number of parallel rollout workers.  Defaults to
-            max(4, os.cpu_count() - 2) for CPU-saturating rollouts.
-        env_config: Optional environment configuration overrides.
+        num_workers (int | None): Number of parallel rollout workers. If None, auto-scaled
+            to ``min(max(1, cpu_count() - 2), 8)``. Increase for faster rollout collection;
+            decrease to reduce per-worker memory overhead.
+        env_config (dict | None): Optional environment configuration dict passed to all workers.
+            Merged with defaults in :func:`env_creator`.
 
     Returns:
-        A configured PPOConfig instance.
+        PPOConfig: A fully specified training configuration ready for ``.build()``.
+
+    Example:
+        >>> config = build_ppo_config(num_workers=6, env_config={"curriculum_phase": 1})
+        >>> algo = config.build()
+        >>> for i in range(50):
+        ...     results = algo.train()
+
+    See Also:
+        - :func:`_detect_gpu_resources`: GPU allocation strategy used by this config
+        - :func:`train`: Main training loop that uses this config
     """
     if env_config is None:
         env_config = {}
@@ -315,13 +420,57 @@ def train(
     num_workers: int | None = None,
     time_inference: bool = False,
 ) -> None:
-    """Run the PPO training loop.
+    """Run the main MAPPO training loop with checkpoint management and metrics logging.
+
+    Orchestrates a multi-iteration training session on :class:`FLReputationEnv` using
+    Ray RLlib. Manages Ray initialization, environment registration, algorithm construction,
+    the training loop, reward normalization, checkpointing, and graceful shutdown.
+
+    Training Loop:
+        1. Initialize Ray (if not already initialized)
+        2. Register :class:`FLReputationEnv` with RLlib
+        3. Build PPO algorithm from config (see :func:`build_ppo_config`)
+        4. For each iteration:
+           - Call ``algo.train()`` (collects rollouts, updates policy)
+           - Normalize episode rewards via Welford online algorithm
+           - Log per-iteration metrics (reward_mean, episode length)
+           - Save checkpoints every 10 iterations
+        5. On completion or interruption, save final checkpoint and shut down Ray
+
+    Checkpointing:
+        Saves checkpoints to :const:`CHECKPOINT_DIR` ("checkpoints/fl_reputation_ppo/")
+        every 10 iterations and at training completion. Tracks the best reward achieved
+        and logs the best checkpoint path for recovery or inference.
+
+    Reward Normalization:
+        Uses :class:`RunningMeanStd` (Welford online algorithm) to compute running
+        statistics of episode rewards. Normalized rewards are logged at DEBUG level
+        and can inform reward pre-conditioning in custom training callbacks.
+
+    GPU Timing (Optional):
+        If ``time_inference=True`` and CUDA is available, wraps each training iteration
+        with ``torch.cuda.synchronize()`` calls to eliminate async measurement lag.
+        Logs wall-time per iteration at INFO level. Adds ~1 ms overhead per iteration.
 
     Args:
-        iterations:      Number of training iterations.
-        num_workers:     Number of parallel rollout workers (None = auto from CPU count).
-        time_inference:  If True, wrap algo.train() with CUDA timing to expose
-                         per-iteration GPU bottlenecks.  Adds ~1 ms overhead per iter.
+        iterations (int): Number of training iterations (default 50). Each iteration
+            collects a train_batch and performs one SGD update pass.
+        num_workers (int | None): Number of parallel rollout workers (default None).
+            If None, auto-scaled to ``min(max(1, cpu_count() - 2), 8)`` by :func:`build_ppo_config`.
+        time_inference (bool): If True, wrap each iteration with CUDA timing to measure
+            GPU overhead (default False). Useful for profiling performance bottlenecks.
+
+    Raises:
+        KeyboardInterrupt: Caught and logged; training shuts down gracefully.
+        Exception: Any uncaught exceptions are logged and re-raised after cleanup.
+
+    Example:
+        >>> train(iterations=100, num_workers=4, time_inference=False)
+
+    See Also:
+        - :func:`build_ppo_config`: Configuration construction
+        - :func:`env_creator`: Environment factory for workers
+        - :mod:`src.rl_agent.kernels`: Reward normalization with Triton kernels
     """
     # ------------------------------------------------------------------
     # Log Triton status so operator knows which reward normalization path is active
@@ -469,10 +618,29 @@ def train(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments.
+    """Parse command-line arguments for the training script.
+
+    Defines and parses all CLI options accepted by the training entry point.
+    Integrates with the :func:`train` function to allow users to customize
+    worker count, iteration depth, and profiling options from the command line.
+
+    Command-Line Options:
+        --iterations: Number of PPO training iterations (default 50)
+        --num-workers: Parallel rollout workers (default None = auto-scale)
+        --time-inference: Enable CUDA timing for inference bottleneck profiling
 
     Returns:
-        Parsed argument namespace.
+        argparse.Namespace: Parsed arguments with attributes:
+            - iterations (int): Number of training iterations
+            - num_workers (int | None): Number of workers (None = auto)
+            - time_inference (bool): Whether to profile CUDA overhead
+
+    Example:
+        >>> args = parse_args()
+        >>> train(iterations=args.iterations, num_workers=args.num_workers)
+
+    See Also:
+        - :func:`train`: Main training function using these arguments
     """
     parser = argparse.ArgumentParser(
         description="Train PPO on FLReputationEnv for FL client reputation learning."
