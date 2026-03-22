@@ -1,0 +1,93 @@
+# =============================================================================
+# .dockerignore — excludes files from the Docker build context
+# Keep the context small: faster builds, no accidental secret leakage.
+# =============================================================================
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.pixi/
+__pypackages__/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+r3_fl.egg-info/
+wheels/
+sdist/
+
+# Test & coverage artifacts
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+nosetests.xml
+.tox/
+.nox/
+
+# Development-only data (mounted as volumes at runtime)
+data/
+checkpoints/
+results/
+
+# Logs
+*.log
+*.pid
+
+# Environment files (NEVER bake secrets into the image)
+.env
+.env.*
+.envrc
+
+# Redis dump files
+dump.rdb
+*.rdb
+*.aof
+
+# Documentation & presentation (not needed at runtime)
+docs/
+presentation/
+TEST_COVERAGE_SUMMARY.md
+
+# Benchmark scripts & outputs
+benchmark/
+
+# Node.js (blockchain subproject — not part of Python runtime image)
+src/blockchain/node_modules/
+src/blockchain/cache/
+src/blockchain/artifacts/
+src/blockchain/typechain-types/
+node_modules/
+
+# IDE / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# CI / misc
+.github/
